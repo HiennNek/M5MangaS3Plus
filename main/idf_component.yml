@@ -1,0 +1,8 @@
+## IDF Component Manager dependencies.
+## M5GFX comes in transitively via m5unified - no need to list it here.
+dependencies:
+  m5stack/m5unified: "^0.2.21"
+  # NOTE: bitbank2/jpegdec is intentionally NOT listed here - it is vendored
+  # under components/jpegdec (same sources, relaxed -Werror flags for IDF v6).
+  # main/CMakeLists.txt still REQUIRES jpegdec, resolved locally.
+  idf: ">=5.1"
