@@ -34,3 +34,8 @@ component registry and are pinned in `dependencies.lock`.
   left to `CONFIG_PM_ENABLE`.
 - `setup()`/`loop()` -> `app_main()` with a FreeRTOS loop; display, touch,
   power and EPD APIs are unchanged (M5Unified/M5GFX work on both frameworks).
+- Quality refresh is Kindle-style: `tools/patch_epd_lut.py` (run at configure
+  time, hash-pinned to the M5GFX version in `dependencies.lock`) replaces the
+  stock ~36-scan `lut_eraser`/`lut_quality` tables with a short black flash
+  -> white -> image script (~18 scans). See the script header for tuning and
+  revert instructions.
