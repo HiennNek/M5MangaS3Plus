@@ -1,16 +1,11 @@
 # M5MangaS3 +
 A manga reader for M5PaperS3 - a fork of the old, unmaintained M5Manga.
 
-## Frameworks
+Pure ESP-IDF app (`main/`, entry `app_main` in `main/main.cpp`).
+Originally ported from an Arduino sketch; the old `src/` + `platformio.ini`
+were removed once the port was complete (still in git history if needed).
 
-This repo contains **two** builds of the same app:
-
-| Dir | Framework | Entry | Deps |
-|-----|-----------|-------|------|
-| `src/` + `platformio.ini` | Arduino (PlatformIO) | `src/main.cpp` (`setup`/`loop`) | M5Unified, M5GFX, JPEGDEC via PlatformIO |
-| `main/` + `CMakeLists.txt` | ESP-IDF v5/v6 | `main/main.cpp` (`app_main`) | `m5stack/m5unified`, `m5stack/m5gfx` via component registry |
-
-### ESP-IDF build (M5PaperS3, ESP32-S3, 16MB flash, 8MB OPI PSRAM)
+## Build (M5PaperS3, ESP32-S3, 16MB flash, 8MB OPI PSRAM)
 
 ```bash
 idf.py set-target esp32s3
@@ -20,8 +15,10 @@ idf.py -p /dev/ttyACM0 flash monitor
 
 `sdkconfig.defaults` already selects ESP32-S3, 16MB QIO flash, OPI PSRAM,
 USB-CDC console and the custom `partitions.csv` (15MB factory app).
+Dependencies (`m5stack/m5unified`, `m5stack/m5gfx`) come from the ESP
+component registry and are pinned in `dependencies.lock`.
 
-### Porting notes (Arduino -> IDF)
+## Porting notes (Arduino -> IDF)
 
 - `String` -> `std::string`; `File`/`SD.h` -> POSIX `fopen`/`opendir`/`stat`
   on the SDMMC mount `/sdcard` (`MANGA_ROOT=/sdcard/manga`,
