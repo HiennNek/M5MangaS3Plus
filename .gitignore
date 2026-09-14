@@ -5,3 +5,9 @@
 .vscode/ipch
 .vscode/extensions.json
 ignore_*
+# ESP-IDF
+build/
+managed_components/
+# NOTE: dependencies.lock is intentionally TRACKED (reproducible app builds).
+sdkconfig
+sdkconfig.old
