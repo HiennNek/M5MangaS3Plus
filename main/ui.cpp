@@ -533,12 +533,13 @@ void drawMenu() {
                 std::string(MANGA_ROOT) + "/" + mangaFolders[fIdx], 0);
             size_t coverSize = loadFileToJpgBuffer(coverPath.c_str());
             if (coverSize > 0) {
-              float imgAspect = 540.0f / 960.0f;
-              int scaledW = (int)((THUMB_H - 4) * imgAspect);
-              int xOffset = (THUMB_W - 4 - scaledW) / 2;
-              if (xOffset < 0) xOffset = 0;
-              menuCacheSprite.drawJpg(jpgBuffer, coverSize, x + 2 + xOffset,
-                                      y + 2, THUMB_W - 4, THUMB_H - 4);
+              // Fit covers of any aspect ratio into the frame, centered.
+              // (x, y) is the inner-box top-left; middle_center anchors the
+              // auto-fitted image inside it, and M5GFX clips to the fitted
+              // box so nothing can spill into the gutter or title.
+              menuCacheSprite.drawJpg(jpgBuffer, coverSize, x + 2, y + 2,
+                                      THUMB_W - 4, THUMB_H - 4, 0, 0, 0.0f,
+                                      0.0f, middle_center);
             } else {
               menuCacheSprite.setTextColor(UI_FG, UI_BG);
               menuCacheSprite.setFont(&fonts::DejaVu12);
