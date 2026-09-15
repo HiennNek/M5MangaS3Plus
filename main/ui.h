@@ -42,5 +42,9 @@ void applyContrast(LGFX_Sprite &sprite);
 const char *contrastPresetName();
 void drawError(const char *msg);
 void systemShutdown();
+// Full original-quality refresh of gSprite's current content (~36 scans,
+// ends ghost-free). See tools/patch_epd_lut.py. Used for the power-off
+// splash that persists on screen.
+void fullRefresh();
 void drawModernButton(LGFX_Sprite &sprite, int x, int y, int w, int h,
                       const char *text, bool isPrimary = false);

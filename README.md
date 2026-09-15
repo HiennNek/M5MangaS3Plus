@@ -59,3 +59,7 @@ purged on book delete and capped at 256 files.
   stock ~36-scan `lut_eraser`/`lut_quality` tables with a short black flash
   -> white -> image script (~18 scans). See the script header for tuning and
   revert instructions.
+- `fullRefresh()` (ui.cpp) renders through the *original* stock waveform
+  for the power-off splash that persists on screen: the same script keeps
+  pristine copies plus a `Panel_EPD::refreshStockWaveform()` one-shot
+  (no switch-back needed; reboot re-expands the Kindle tables).

@@ -1,67 +1,73 @@
 #!/usr/bin/env python3
-"""Kindle-style EPD quality waveform for M5PaperS3 (M5GFX Panel_EPD).
+"""Kindle-style EPD quality waveform + stock one-shot for M5PaperS3.
 
 Background: stock M5GFX drives every epd_quality refresh as ~36 full panel
-scans: eraser shuffle (4) + pre-drive (1) + white flash (2) + black flash (2)
-+ 10 vendor gray rows + 16 NOP settle holds + end markers. Commercial readers
-(Kindle etc.) instead do a simple black flash -> white -> image.
+scans. For fast page turns this project normally uses a short Kindle-like
+script instead (black flash -> white -> image, ~18 scans). But the power-off
+splash persists on screen unwatched, so it deserves one full original
+refresh to settle ghost-free.
 
-What this does: replaces ONLY the two builtin LUT data tables in the managed
-M5GFX copy with a short Kindle-like script. No engine logic is touched, so
-the step/retire machinery (step_quality, blit_dmabuf, offset tables, sizeof
-step counts) keeps working unchanged:
+What this does to the managed M5GFX copy (Panel_EPD only, data + one
+method; the step/retire engine is untouched):
 
-  lut_eraser  (indexed by OLD pixels, runs first):
-      2x all-black drive + end marker (3 scans; was 4).
-      Uniform flash: every level is driven to black identically, fully
-      clearing previous content. The end marker hands pixels to the pending
-      (new image) pointer.
-  lut_quality (indexed by NEW pixels, runs second):
-      2x all-white flash + the 10 stock vendor gray rows verbatim +
-      2 settle holds + end marker (15 scans; was 32).
+  1. Kindle tables (default boot behavior): lut_eraser/lut_quality hold a
+     short black -> white -> image script (~18 scans).
+  2. Stock tables (on demand): lut_eraser_stock (3 steps, NOP dropped so
+     both eraser variants share the restart threshold) + lut_quality_stock
+     (full original 32 steps) are kept alongside.
+  3. Panel_EPD::refreshStockWaveform(): waits for idle, parks every pixel
+     at eraser step 0 (value kept as LUT index), and re-expands the LUT
+     from the STOCK tables. The next display() then runs one full
+     original-quality sequence ending on the new image. No switch-back:
+     the only caller is the power-off splash; reboot re-expands Kindle.
 
-Result per quality refresh: ~18 scans (~1.2s) with a black -> white -> image
-sequence, instead of ~36 scans (~2.4s) of flicker.
-
-Tuning (edit NEW_QUALITY below, then rebuild):
-  - more all-white rows = cleaner whites, slower.
-  - more ~0u hold rows = less ghosting on later fast updates, slower.
-  - the 10 image rows are the vendor-tuned 16-gray convergence; trimming
-    them posterizes grays (manga screentones suffer first).
+Usage from the app (see fullRefresh() in main/ui.cpp):
+  draw splash into gSprite (no display yet) -> refreshStockWaveform() ->
+  push + display() in epd_quality -> waitDisplay() -> power off.
 
 Safety:
 - Runs at CMake configure time via main/CMakeLists.txt (hook there).
-- Pinned by SHA256 to the exact upstream file it was written for
-  (M5GFX 0.2.29, see dependencies.lock). Any M5GFX update changes the hash
-  -> configure stops with a loud error instead of silently building a
-  mismatched tree. Re-verify the LUT block and update EXPECTED_PRISTINE.
-- Idempotent: re-runs detect MARKER and do nothing.
-- To revert to stock behavior, delete the hook block in main/CMakeLists.txt,
-  delete this file, and run `idf.py fullclean` (managed_components/ is
+- Pinned by SHA256 to the exact upstream files it was written for
+  (M5GFX 0.2.29, see dependencies.lock). Unknown input is REFUSED, never
+  half-patched. Re-verify anchors and update EXPECTED_* on M5GFX updates.
+- Idempotent: re-runs detect MARKER_V2 in both files and do nothing.
+- To revert fully, delete the hook block in main/CMakeLists.txt, delete
+  this file, and run `idf.py fullclean` (managed_components/ is
   re-downloaded pristine).
+
+Test hooks (not used by the build): argv [cpp_path] [hpp_path] override the
+targets, and M5MANGA_EPD_EXPECTED_CPP / M5MANGA_EPD_EXPECTED_HPP override
+the pristine hashes, so fixtures can exercise every state.
 """
 import hashlib
+import os
 import pathlib
 import sys
 
-EPD_CPP = (
-    pathlib.Path(__file__).resolve().parent.parent
-    / "managed_components"
-    / "m5stack__m5gfx"
-    / "src"
-    / "lgfx"
-    / "v1"
-    / "platforms"
-    / "esp32"
-    / "Panel_EPD.cpp"
-)
+REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 
-# sha256 of the exact upstream Panel_EPD.cpp this patch applies to.
-EXPECTED_PRISTINE = (
-    "783699ae0eb2bca04cde9c5958ba3946e516833f95d7903da0e8db18270c16a4"
-)
 
-MARKER = "M5MangaS3Plus Kindle-style"
+def targets():
+    if len(sys.argv) > 2:
+        return pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])
+    return (REPO_ROOT.joinpath(*PP), REPO_ROOT.joinpath(*HP))
+
+
+PP = ("managed_components", "m5stack__m5gfx", "src", "lgfx", "v1",
+      "platforms", "esp32", "Panel_EPD.cpp")
+HP = ("managed_components", "m5stack__m5gfx", "src", "lgfx", "v1",
+      "platforms", "esp32", "Panel_EPD.hpp")
+
+# sha256 of the exact upstream files this patch applies to.
+EXPECTED_PRISTINE_CPP = os.environ.get(
+    "M5MANGA_EPD_EXPECTED_CPP",
+    "783699ae0eb2bca04cde9c5958ba3946e516833f95d7903da0e8db18270c16a4")
+EXPECTED_PRISTINE_HPP = os.environ.get(
+    "M5MANGA_EPD_EXPECTED_HPP",
+    "600c1ab594fb26cdab16c1b827a5b017c364c174d680f1322211f60543307df3")
+
+MARKER_V1 = "M5MangaS3Plus Kindle-style"
+MARKER_V2 = "M5MangaS3Plus stock waveform"
 
 OLD_ERASER = """  static constexpr const uint32_t lut_eraser[] = {
     LUT_MAKE(2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 1, 1),
@@ -124,34 +130,173 @@ NEW_QUALITY = """  // >>> M5MangaS3Plus Kindle-style quality waveform (tools/pat
     0u,
   };"""
 
+# Pristine copies kept for the on-demand stock rebuild. The stock eraser
+# drops its NOP row so both eraser variants are 3 steps and the shared
+# restart threshold (lut_eraser_step) stays valid either way.
+STOCK_TABLES = """  // >>> M5MangaS3Plus stock waveform tables (tools/patch_epd_lut.py).
+  // Pristine upstream copies for Panel_EPD::refreshStockWaveform().
+  static constexpr const uint32_t lut_eraser_stock[] = {
+    LUT_MAKE(2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 1, 1),
+    LUT_MAKE(2, 2, 3, 3, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1),
+    0u,
+  };
+  static constexpr const size_t lut_eraser_stock_step =
+      sizeof(lut_eraser_stock) / sizeof(uint32_t);
+  static constexpr const uint32_t lut_quality_stock[] = {
+    LUT_MAKE(1, 1, 1, 1, 1, 1, 1, 2, 1, 2, 2, 1, 1, 1, 1, 1),
+    LUT_MAKE(2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2),
+    LUT_MAKE(2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2),
+    LUT_MAKE(1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1),
+    LUT_MAKE(1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1),
+    LUT_MAKE(1, 1, 1, 1, 1, 1, 1, 1, 2, 1, 1, 1, 1, 1, 1, 1),
+    LUT_MAKE(1, 1, 2, 2, 1, 1, 1, 2, 1, 2, 1, 1, 1, 1, 1, 3),
+    LUT_MAKE(1, 1, 1, 1, 1, 2, 1, 1, 2, 2, 1, 2, 1, 2, 2, 2),
+    LUT_MAKE(1, 1, 3, 2, 2, 1, 2, 2, 2, 2, 2, 2, 1, 1, 2, 2),
+    LUT_MAKE(3, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2),
+    LUT_MAKE(3, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2),
+    LUT_MAKE(1, 1, 1, 1, 3, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2),
+    LUT_MAKE(1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 3, 3, 2, 2, 2, 2),
+    LUT_MAKE(3, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 3),
+    LUT_MAKE(3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 2, 2, 2, 3),
+    ~0u, ~0u, ~0u, ~0u,
+    ~0u, ~0u, ~0u, ~0u,
+    ~0u, ~0u, ~0u, ~0u,
+    ~0u, ~0u, ~0u, ~0u,
+    0u,
+  };
+"""
+
+ENGINE_METHOD = """  // >>> M5MangaS3Plus stock waveform one-shot (tools/patch_epd_lut.py).
+  // Rebuilds the expanded LUT from the STOCK tables and parks every pixel
+  // at eraser step 0 (value kept as LUT index), so the next display() runs
+  // one full original-quality sequence (~36 scans) ending on the new image.
+  // No switch-back: the only caller is the power-off splash, and reboot
+  // re-expands the Kindle tables from scratch.
+  void Panel_EPD::refreshStockWaveform(void)
+  {
+    waitDisplay();
+    if (!_step_framebuf || !_lut_2pixel) return;
+    const size_t cells =
+        (size_t)_cfg.memory_width * (size_t)_cfg.memory_height / 2;
+    for (size_t i = 0; i < cells; ++i) {
+      _step_framebuf[i * 2] &= 0xFF;
+      _step_framebuf[i * 2 + 1] ^= 0xFFFF;
+    }
+    const size_t total = lut_eraser_stock_step
+                       + sizeof(lut_quality_stock) / sizeof(uint32_t)
+                       + _config_detail.lut_text_step
+                       + _config_detail.lut_fast_step
+                       + _config_detail.lut_fastest_step;
+    auto *buf = (uint8_t *)heap_caps_malloc(total * 256 * sizeof(uint16_t),
+                                            MALLOC_CAP_DMA);
+    if (!buf) return;  // keep Kindle tables; splash still shows
+    memset(buf, 0x0F, 256);
+    size_t lindex = 0;
+    for (int epd_mode = 0; epd_mode < 5; ++epd_mode) {
+      const uint32_t* lut_src = nullptr;
+      size_t lut_step = 0;
+      switch (epd_mode) {
+        default:                      lut_src = lut_eraser_stock; lut_step = lut_eraser_stock_step; break;
+        case epd_mode_t::epd_quality: lut_src = lut_quality_stock; lut_step = sizeof(lut_quality_stock) / sizeof(uint32_t); break;
+        case epd_mode_t::epd_text:    lut_src = _config_detail.lut_text;    lut_step = _config_detail.lut_text_step;    break;
+        case epd_mode_t::epd_fast:    lut_src = _config_detail.lut_fast;    lut_step = _config_detail.lut_fast_step;    break;
+        case epd_mode_t::epd_fastest: lut_src = _config_detail.lut_fastest; lut_step = _config_detail.lut_fastest_step; break;
+      }
+      if (lut_src == nullptr) { continue; }
+      _lut_offset_table[epd_mode] = lindex >> 8;
+      _lut_remain_table[epd_mode] = lut_step;
+      for (int step = 0; step < lut_step; ++step) {
+        auto lu = lut_src[0];
+        for (int lv = 0; lv < 256; ++lv) {
+          buf[lindex] = (((lu >> ((lv >> 4) << 1)) & 3) << 2) + ((lu >> ((lv & 15) << 1)) & 3);
+          ++lindex;
+        }
+        ++lut_src;
+      }
+    }
+    heap_caps_free(_lut_2pixel);
+    _lut_2pixel = buf;
+  }
+
+"""
+
+HPP_DECL = """    // M5MangaS3Plus stock waveform one-shot (tools/patch_epd_lut.py).
+    void refreshStockWaveform(void);
+"""
+
+
+def sha256(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def replace_once(text, old, new, what):
+    n = text.count(old)
+    if n != 1:
+        print(f"EPD patch: anchor for {what} found {n}x "
+              f"(expected exactly 1x), aborting.")
+        return None
+    return text.replace(old, new)
+
 
 def main() -> int:
-    if not EPD_CPP.is_file():
-        print(f"EPD LUT patch: {EPD_CPP} not found "
-              f"(managed_components not downloaded yet?)")
+    EPD_CPP, EPD_HPP = targets()
+    if not EPD_CPP.is_file() or not EPD_HPP.is_file():
+        print("EPD patch: Panel_EPD sources not found "
+              "(managed_components not downloaded yet?)")
         return 1
-    text = EPD_CPP.read_text()
-    if MARKER in text:
-        print("EPD LUT patch: already applied, skipping.")
+    cpp = EPD_CPP.read_text()
+    hpp = EPD_HPP.read_text()
+
+    cpp_v2, hpp_v2 = MARKER_V2 in cpp, MARKER_V2 in hpp
+    if cpp_v2 and hpp_v2:
+        print("EPD patch: already applied, skipping.")
         return 0
-    digest = hashlib.sha256(text.encode()).hexdigest()
-    if digest != EXPECTED_PRISTINE:
-        print("EPD LUT patch: REFUSED - Panel_EPD.cpp hash mismatch.\n"
-              f"  expected: {EXPECTED_PRISTINE}\n"
-              f"  actual:   {digest}\n"
-              "  M5GFX was probably updated; re-verify the LUT tables and "
-              "update EXPECTED_PRISTINE in tools/patch_epd_lut.py.")
+    if cpp_v2 != hpp_v2:
+        print("EPD patch: INCONSISTENT state (one file patched, one not). "
+              "Run `idf.py fullclean` and rebuild.")
         return 1
-    for name, old, new in (("lut_eraser", OLD_ERASER, NEW_ERASER),
-                           ("lut_quality", OLD_QUALITY, NEW_QUALITY)):
-        if text.count(old) != 1:
-            print(f"EPD LUT patch: anchor block for {name} found "
-                  f"{text.count(old)}x (expected exactly 1x), aborting.")
+
+    if MARKER_V1 not in cpp:
+        if sha256(EPD_CPP) != EXPECTED_PRISTINE_CPP:
+            print("EPD patch: REFUSED - Panel_EPD.cpp hash mismatch.\n"
+                  f"  M5GFX was probably updated; re-verify anchors and "
+                  f"update EXPECTED_PRISTINE_CPP in tools/patch_epd_lut.py.")
             return 1
-        text = text.replace(old, new)
-    EPD_CPP.write_text(text)
-    print("EPD LUT patch: Kindle-style lut_eraser/lut_quality applied "
-          "(~18 scans per quality refresh, was ~36).")
+        for name, old, new in (("lut_eraser", OLD_ERASER, NEW_ERASER),
+                               ("lut_quality", OLD_QUALITY, NEW_QUALITY)):
+            cpp = replace_once(cpp, old, new, name)
+            if cpp is None:
+                return 1
+
+    # Stock tables + engine method (both input states reach here).
+    r = replace_once(cpp, "#undef LUT_MAKE",
+                     STOCK_TABLES + "#undef LUT_MAKE", "stock tables")
+    if r is None:
+        return 1
+    cpp = r
+    r = replace_once(cpp, "  void Panel_EPD::beginTransaction(void)",
+                     ENGINE_METHOD + "  void Panel_EPD::beginTransaction(void)",
+                     "engine method")
+    if r is None:
+        return 1
+    cpp = r
+
+    if sha256(EPD_HPP) != EXPECTED_PRISTINE_HPP and MARKER_V2 not in hpp:
+        print("EPD patch: REFUSED - Panel_EPD.hpp hash mismatch.\n"
+              "  M5GFX was probably updated; re-verify anchors and update "
+              "EXPECTED_PRISTINE_HPP in tools/patch_epd_lut.py.")
+        return 1
+    r = replace_once(hpp, "    void setPowerSave(bool flg) override;",
+                     "    void setPowerSave(bool flg) override;\n" + HPP_DECL,
+                     "hpp decl")
+    if r is None:
+        return 1
+    hpp = r
+
+    EPD_CPP.write_text(cpp)
+    EPD_HPP.write_text(hpp)
+    print("EPD patch: Kindle tables + stock one-shot applied "
+          "(default ~18 scans; fullRefresh() runs the original ~36).")
     return 0
 
 

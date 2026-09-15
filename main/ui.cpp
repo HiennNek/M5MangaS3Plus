@@ -17,6 +17,8 @@
 #include "thumb.h"
 #include "wifi_server.h"
 #include "M5Unified.h"
+// Panel_EPD for refreshStockWaveform() (injected by tools/patch_epd_lut.py).
+#include "lgfx/v1/platforms/esp32/Panel_EPD.hpp"
 
 static const char *TAG = "ui";
 
@@ -722,6 +724,20 @@ void drawControlCenter() {
   M5.Display.endWrite();
 }
 
+void fullRefresh() {
+  M5.Display.setEpdMode(epd_mode_t::epd_quality);
+  // PaperS3-only firmware: the panel is always the direct-drive EPD.
+  if (M5.Display.getBoard() == lgfx::board_M5PaperS3) {
+    auto *panel = static_cast<lgfx::Panel_EPD *>(M5.Display.getPanel());
+    if (panel) panel->refreshStockWaveform();
+  }
+  M5.Display.startWrite();
+  gSprite.pushSprite(0, 0);
+  M5.Display.display();
+  M5.Display.endWrite();
+  M5.Display.waitDisplay();
+}
+
 void systemShutdown() {
   setCpuFrequencyMhz(240);
   M5.Display.setEpdMode(epd_mode_t::epd_quality);
@@ -739,7 +755,7 @@ void systemShutdown() {
     }
     closedir(root);
   }
-  bool drawn = false;
+  bool haveImage = false;
   if (!pics.empty()) {
     size_t r = esp_random() % pics.size();
     std::string path = pics[r];
@@ -752,16 +768,17 @@ void systemShutdown() {
       size_t sz = loadFileToJpgBuffer(path.c_str());
       if (sz > 0 &&
           decodeImageToSprite(gSprite, jpgSharedBuffer(), sz, 0, 0,
-                              DISPLAY_W, DISPLAY_H)) {
-        M5.Display.startWrite();
-        gSprite.pushSprite(0, 0);
-        M5.Display.display();
-        M5.Display.endWrite();
-        drawn = true;
-      }
+                              DISPLAY_W, DISPLAY_H))
+        haveImage = true;
     }
   }
-  if (!drawn) {
+  if (!haveImage) {
+    prepareSprite(gSprite, DISPLAY_W, DISPLAY_H, 16, true);
+    if (gSprite.getBuffer()) gSprite.fillScreen(TFT_WHITE);
+  }
+  if (gSprite.getBuffer())
+    fullRefresh();  // stock sequence so the splash persists ghost-free
+  else {
     M5.Display.fillScreen(TFT_WHITE);
     M5.Display.display();
   }
