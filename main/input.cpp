@@ -37,20 +37,96 @@ static void adjustPendingPage(int delta) {
   requestRedraw();
 }
 
+// Pinch-zoom session: set once the spread exceeds ZOOM_ENGAGE.
+static bool zoomEngaged = false;
+// Render freshness while zoomed; shared with the no-touch poll path.
+static bool qualityApplied = false;
+static bool zoomSettleArmed = false;
+static uint32_t zoomSettleTime = 0;
+
+static void exitZoom(bool redraw) {
+  if (!isZoomed) return;
+  isZoomed = false;
+  zoomFactor = 1.0f;
+  zoomEngaged = false;
+  zoomSettleArmed = false;
+  if (redraw) needRedraw = true;
+}
+
+// Delayed single-tap: a quick tap waits DOUBLE_TAP_MS for a possible second
+// tap (zoom entry, centered on it) before turning the page. Fired from the
+// touch-idle path since it triggers with no fingers down.
+static bool pendingTapArmed = false;
+static uint32_t pendingTapTime = 0;
+static int pendingTapX = 0, pendingTapY = 0;
+
+static void disarmPendingTap() { pendingTapArmed = false; }
+
+static void firePendingTap() {
+  disarmPendingTap();
+  if (pendingTapX >= LEFT_ZONE_W) {
+    if (currentPage < totalPages - 1) {
+      currentPage++;
+      requestRedraw(epd_mode_t::epd_quality);
+      saveProgress();
+    }
+  } else {
+    if (currentPage > 0) {
+      currentPage--;
+      requestRedraw(epd_mode_t::epd_quality);
+      saveProgress();
+    }
+  }
+}
+
+static void pollPendingTap() {
+  if (!pendingTapArmed) return;
+  if (appState != STATE_READER || controlMenuOpen || bookConfigOpen ||
+      isZoomed) {
+    disarmPendingTap();
+    return;
+  }
+  if (idf_millis() - pendingTapTime >= DOUBLE_TAP_MS) firePendingTap();
+}
+
+// A lone tap while zoomed must not render immediately: a quality refresh
+// blocks far longer than DOUBLE_TAP_MS and would swallow the second tap,
+// making zoom unexitable. Settle only once the window passes tap-free.
+static void pollZoomSettle() {
+  if (!zoomSettleArmed) return;
+  if (!isZoomed || qualityApplied) {
+    zoomSettleArmed = false;
+    return;
+  }
+  if (idf_millis() - zoomSettleTime < DOUBLE_TAP_MS) return;
+  zoomSettleArmed = false;
+  drawZoomed(true);
+  qualityApplied = true;
+}
+
 void handleTouch() {
+  if (appState != STATE_READER) {
+    // Reader overlays and other screens scribble over gSprite, which the
+    // zoom view reads from — drop zoom while away. Also drop any pending
+    // tap so it can't fire after returning.
+    exitZoom(false);
+    disarmPendingTap();
+  }
+
   if (M5.Touch.getCount() == 0) {
-    if (isMagnifierActive) {
-      isMagnifierActive = false;
-      resetMagnifierTracking();
-      needRedraw = true;
+    if (appState == STATE_READER && !controlMenuOpen && !bookConfigOpen) {
+      pollPendingTap();
+      pollZoomSettle();
     }
     return;
   }
 
   auto &t = M5.Touch.getDetail(0);
 
-  if (!isMagnifierActive && !controlMenuOpen && t.wasReleased() &&
+  if (!isZoomed && !controlMenuOpen && t.wasReleased() &&
       t.base_y < HEADER_H && t.distanceY() > SWIPE_UP_MIN) {
+    disarmPendingTap();
+    exitZoom(false);
     controlMenuOpen = true;
     requestRedraw();
     return;
@@ -305,7 +381,7 @@ void handleMenuTouch(const m5::touch_detail_t &t) {
     M5.Display.setCursor(barX + 15, barY + 12);
     M5.Display.print("CONTINUE: ");
     M5.Display.setFont(&fonts::DejaVu18);
-    std::string shortName = lastMangaName;
+    std::string shortName = displayName(lastMangaName);
     if (shortName.length() > 19) shortName = shortName.substr(0, 17) + "...";
     M5.Display.print(shortName.c_str());
     M5.Display.setFont(&fonts::DejaVu12);
@@ -351,77 +427,198 @@ void handleMenuTouch(const m5::touch_detail_t &t) {
 void handleReaderTouch(const m5::touch_detail_t &t) {
   static uint32_t pressStart = 0;
   static uint32_t lastMoveTime = 0;
-  static bool potentialLongPress = false;
-  static bool qualityApplied = false;
-  static bool wasMagnifying = false;
+  static bool pinchActive = false;
+  static float pinchBaseDist = 1.0f;
+  static float pinchBaseZoom = 1.0f;
+  static int lastPinchMX = 0, lastPinchMY = 0;
+  static float panRemX = 0.0f, panRemY = 0.0f;
+  static bool multiTouchPress = false;
+  static uint32_t lastTapTime = 0;
+  static int lastTapX = 0, lastTapY = 0;
 
-  if (t.wasPressed()) {
-    pressStart = idf_millis();
-    lastMoveTime = idf_millis();
-    potentialLongPress = true;
-    qualityApplied = false;
-    wasMagnifying = false;
-  }
+  const uint32_t now = idf_millis();
+  const int count = M5.Touch.getCount();
 
-  if (t.isPressed()) {
-    if (potentialLongPress && !isMagnifierActive &&
-        (idf_millis() - pressStart > LONG_PRESS_MS)) {
-      isMagnifierActive = true;
-      wasMagnifying = true;
-      potentialLongPress = false;
-      lastMoveTime = idf_millis();
+  // ---- two fingers: pinch adjusts an active zoom (double-tap enters) ----
+  if (count >= 2) {
+    multiTouchPress = true;
+    disarmPendingTap();
+    if (!isZoomed) return;
+    const auto &a = M5.Touch.getDetail(0);
+    const auto &b = M5.Touch.getDetail(1);
+    const float dx = (float)a.x - (float)b.x;
+    const float dy = (float)a.y - (float)b.y;
+    const float dist = sqrtf(dx * dx + dy * dy);
+    const int mx = (a.x + b.x) / 2;
+    const int my = (a.y + b.y) / 2;
+
+    if (!pinchActive) {
+      pinchActive = true;
+      pinchBaseDist = (dist > 1.0f) ? dist : 1.0f;
+      pinchBaseZoom = zoomFactor;
+      lastPinchMX = mx;
+      lastPinchMY = my;
+      panRemX = panRemY = 0.0f;
+      lastMoveTime = now;
+      qualityApplied = false;
+      return;
     }
 
-    if (isMagnifierActive) {
-      static int lastMagX = -1, lastMagY = -1;
-      if (abs(t.x - lastMagX) > 4 || abs(t.y - lastMagY) > 4) {
-        drawMagnifier(t.x, t.y, false);
-        lastMagX = t.x;
-        lastMagY = t.y;
-        lastMoveTime = idf_millis();
+    if (dist > 1.0f) {
+      float z = pinchBaseZoom * dist / pinchBaseDist;
+      if (z < ZOOM_MIN) z = ZOOM_MIN;
+      if (z > ZOOM_MAX) z = ZOOM_MAX;
+      if (z > ZOOM_ENGAGE) zoomEngaged = true;
+      if (fabsf(z - zoomFactor) > 0.005f || abs(mx - lastPinchMX) > 2 ||
+          abs(my - lastPinchMY) > 2) {
+        zoomFactor = z;
+        zoomCX = mx;
+        zoomCY = my;
+        clampZoomViewport();
+        lastPinchMX = zoomCX;
+        lastPinchMY = zoomCY;
+        drawZoomed(false);
+        lastMoveTime = now;
         qualityApplied = false;
-      } else if (!qualityApplied && (idf_millis() - lastMoveTime > 300)) {
-        drawMagnifier(t.x, t.y, true);
-        qualityApplied = true;
       }
-      return;
+    }
+
+    // Pinch fully closed after a real zoom: back to the normal page.
+    if (zoomEngaged && zoomFactor <= ZOOM_EXIT) {
+      pinchActive = false;
+      exitZoom(true);
+    }
+    return;
+  }
+
+  if (pinchActive) {
+    // 2 -> 1 transition: end the pinch, anchor here to avoid a pan jump.
+    pinchActive = false;
+    lastMoveTime = now;
+    qualityApplied = false;
+  }
+
+  // ---- one finger ----
+  if (t.wasPressed()) {
+    pressStart = now;
+    lastMoveTime = now;
+    qualityApplied = false;
+    zoomSettleArmed = false;
+    multiTouchPress = false;
+    panRemX = panRemY = 0.0f;
+  }
+
+  if (t.isPressed() && isZoomed) {
+    const int pdx = t.deltaX();
+    const int pdy = t.deltaY();
+    if (pdx != 0 || pdy != 0) {
+      // Glide: content follows the finger 1:1 (page-space delta).
+      panRemX += (float)pdx / zoomFactor;
+      panRemY += (float)pdy / zoomFactor;
+      const int stepX = (int)panRemX;
+      const int stepY = (int)panRemY;
+      panRemX -= (float)stepX;
+      panRemY -= (float)stepY;
+      if (stepX != 0 || stepY != 0) {
+        zoomCX -= stepX;
+        zoomCY -= stepY;
+        clampZoomViewport();
+        drawZoomed(false);
+        lastMoveTime = now;
+        qualityApplied = false;
+      }
+    } else if (!qualityApplied && now - lastMoveTime > ZOOM_SETTLE_MS) {
+      drawZoomed(true);
+      qualityApplied = true;
     }
   }
 
   if (t.wasReleased()) {
-    potentialLongPress = false;
-    if (isMagnifierActive) {
-      isMagnifierActive = false;
-      resetMagnifierTracking();
-      needRedraw = true;
+    const bool quickTap =
+        !multiTouchPress && (now - pressStart < TAP_MAX_MS) &&
+        abs(t.distanceX()) < TAP_SLOP_PX && abs(t.distanceY()) < TAP_SLOP_PX;
+    multiTouchPress = false;
+
+    if (isZoomed) {
+      if (quickTap) {
+        // Double-tap exits zoom; a lone tap just settles the render.
+        if (now - lastTapTime < DOUBLE_TAP_MS &&
+            abs(t.x - lastTapX) < TAP_SLOP_PX * 2 &&
+            abs(t.y - lastTapY) < TAP_SLOP_PX * 2) {
+          lastTapTime = 0;
+          exitZoom(true);
+        } else {
+          lastTapTime = now;
+          lastTapX = t.x;
+          lastTapY = t.y;
+          // No immediate redraw here (see pollZoomSettle): it would block
+          // past the double-tap window and eat the exit tap.
+          zoomSettleArmed = true;
+          zoomSettleTime = now;
+        }
+      } else if (!zoomEngaged) {
+        // Pinch that never spread: silently back to the normal page.
+        exitZoom(true);
+      } else if (!qualityApplied) {
+        // Release after a glide: settle to quality, stay zoomed.
+        drawZoomed(true);
+        qualityApplied = true;
+      }
+      return;
+    }
+    // Not zoomed: book-config swipe, then tap (single: delayed page turn,
+    // double: zoom in centered on the tap spot).
+    if (t.base_y > DISPLAY_H - 150 && t.distanceY() < -SWIPE_UP_MIN) {
+      disarmPendingTap();
+      exitZoom(false);
+      bookConfigOpen = true;
+      bookConfigPendingPage = currentPage;
+      requestRedraw();
       return;
     }
 
-    if (!wasMagnifying) {
-      if (t.base_y > DISPLAY_H - 150 && t.distanceY() < -SWIPE_UP_MIN) {
-        bookConfigOpen = true;
-        bookConfigPendingPage = currentPage;
-        requestRedraw();
-        return;
-      }
-
-      if (idf_millis() - pressStart < LONG_PRESS_MS) {
-        if (t.x >= LEFT_ZONE_W) {
-          if (currentPage < totalPages - 1) {
-            currentPage++;
-            requestRedraw(epd_mode_t::epd_quality);
-            saveProgress();
-          }
-        } else {
-          if (currentPage > 0) {
-            currentPage--;
-            requestRedraw(epd_mode_t::epd_quality);
-            saveProgress();
-          }
-        }
-      }
+    if (!quickTap) {
+      // Drags and slow presses cancel any tap still waiting on its double.
+      disarmPendingTap();
+      return;
     }
+    if (pendingTapArmed && now - pendingTapTime < DOUBLE_TAP_MS &&
+        abs(t.x - pendingTapX) < TAP_SLOP_PX * 2 &&
+        abs(t.y - pendingTapY) < TAP_SLOP_PX * 2) {
+      // Double-tap: enter zoom centered on the tap spot.
+      disarmPendingTap();
+      lastTapTime = 0;
+      isZoomed = true;
+      zoomEngaged = true;
+      zoomFactor = ZOOM_DOUBLE_TAP;
+      zoomCX = t.x;
+      zoomCY = t.y;
+      clampZoomViewport();
+      drawZoomed(true);
+      lastMoveTime = now;
+      qualityApplied = true;
+      return;
+    }
+    if (pendingTapArmed) {
+      // Second tap elsewhere: the first tap was a lone turn, fire it now.
+      firePendingTap();
+    }
+    pendingTapArmed = true;
+    pendingTapTime = now;
+    pendingTapX = t.x;
+    pendingTapY = t.y;
   }
+}
+// Adjust the pending chapter by a delta, jumping to the first page of the
+// neighboring chapter (clamped at the ends).
+static void jumpToChapter(int delta) {
+  const ChapterList &ch = getChapters(currentMangaPath);
+  if (ch.names.empty()) return;
+  int cur = chapterIndexForPage(currentMangaPath, bookConfigPendingPage);
+  if (cur < 0) cur = 0;
+  int nxt = std::max(0, std::min((int)ch.names.size() - 1, cur + delta));
+  bookConfigPendingPage = ch.starts[(size_t)nxt];
+  requestRedraw();
 }
 
 void handleBookConfigTouch(const m5::touch_detail_t &t) {
@@ -429,8 +626,8 @@ void handleBookConfigTouch(const m5::touch_detail_t &t) {
 
   int tapX = t.x;
   int tapY = t.y;
-  int modW = 460;
-  int modH = 490;
+  int modW = BOOK_MOD_W;
+  int modH = BOOK_MOD_H;
   int modX = (DISPLAY_W - modW) / 2;
   int modY = (DISPLAY_H - modH) / 2;
 
@@ -441,8 +638,8 @@ void handleBookConfigTouch(const m5::touch_detail_t &t) {
     return;
   }
 
-  int barY = modY + 90;
-  if (tapY >= barY && tapY <= barY + 80) {
+  int barY = modY + BOOK_PAGE_Y;
+  if (tapY >= barY && tapY <= barY + BOOK_PAGE_H) {
     if (tapX < modX + 100)
       adjustPendingPage(-10);
     else if (tapX < modX + 180)
@@ -454,11 +651,21 @@ void handleBookConfigTouch(const m5::touch_detail_t &t) {
     return;
   }
 
-  int btnW = modW - 60;
-  int btnX = modX + 30;
-  int btnH = 60;
+  // Chapter stepper region (only active for multi-section CBZ).
+  int chapY = modY + BOOK_CHAP_Y;
+  if (tapY >= chapY && tapY <= chapY + BOOK_CHAP_H) {
+    if (tapX < modX + BOOK_CHAP_ZONE)
+      jumpToChapter(-1);
+    else if (tapX > modX + modW - BOOK_CHAP_ZONE)
+      jumpToChapter(+1);
+    return;
+  }
 
-  int btnY0 = modY + 190;
+  int btnW = BOOK_BTN_W;
+  int btnX = modX + BOOK_BTN_XOFF;
+  int btnH = BOOK_BTN_H;
+
+  int btnY0 = modY + BOOK_BTN_DITHER_Y;
   if (tapX >= btnX && tapX <= btnX + btnW && tapY >= btnY0 &&
       tapY <= btnY0 + btnH) {
     ditherMode = (DitherMode)((ditherMode + 1) % DITHER_COUNT);
@@ -467,7 +674,7 @@ void handleBookConfigTouch(const m5::touch_detail_t &t) {
     return;
   }
 
-  int btnY1 = modY + 260;
+  int btnY1 = modY + BOOK_BTN_CONTRAST_Y;
   if (tapX >= btnX && tapX <= btnX + btnW && tapY >= btnY1 &&
       tapY <= btnY1 + btnH) {
     contrastPreset = (ContrastPreset)((contrastPreset + 1) % CONTRAST_COUNT);
@@ -476,7 +683,7 @@ void handleBookConfigTouch(const m5::touch_detail_t &t) {
     return;
   }
 
-  int btnY2 = modY + 330;
+  int btnY2 = modY + BOOK_BTN_BOOKMARK_Y;
   if (tapX >= btnX && tapX <= btnX + btnW && tapY >= btnY2 &&
       tapY <= btnY2 + btnH) {
     M5.Display.startWrite();
@@ -499,7 +706,7 @@ void handleBookConfigTouch(const m5::touch_detail_t &t) {
     return;
   }
 
-  int btnY3 = modY + 400;
+  int btnY3 = modY + BOOK_BTN_RETURN_Y;
   if (tapX >= btnX && tapX <= btnX + btnW && tapY >= btnY3 &&
       tapY <= btnY3 + btnH) {
     M5.Display.startWrite();

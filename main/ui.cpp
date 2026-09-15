@@ -14,62 +14,39 @@
 #include "icon.h"
 #include "state.h"
 #include "storage.h"
+#include "thumb.h"
 #include "wifi_server.h"
 #include "M5Unified.h"
 
 static const char *TAG = "ui";
 
-// JPEG decoding uses M5GFX's built-in TJpgD (no external JPEGDEC component,
-// which does not build on IDF 6.x). Images are decoded straight into the
-// target sprite, then contrast/dithering runs on the sprite buffer.
-static bool decodeJpgToSprite(LGFX_Sprite &spr, uint8_t *buf, size_t size,
-                              int x, int y, int maxWidth, int maxHeight) {
+// Image decoding uses M5GFX's built-in codecs (no external JPEGDEC
+// component, which does not build on IDF 6.x). Format is sniffed from magic
+// bytes so CBZ entries work regardless of their file extension. Images are
+// decoded straight into the target sprite, then contrast/dithering runs on
+// the sprite buffer.
+static bool isJpeg(const uint8_t *buf, size_t size) {
+  return size >= 2 && buf[0] == 0xFF && buf[1] == 0xD8;
+}
+static bool isPng(const uint8_t *buf, size_t size) {
+  return size >= 4 && buf[0] == 0x89 && buf[1] == 'P' && buf[2] == 'N' &&
+         buf[3] == 'G';
+}
+
+static bool decodeImageToSprite(LGFX_Sprite &spr, uint8_t *buf, size_t size,
+                                int x, int y, int maxWidth, int maxHeight) {
   if (!buf || size == 0) return false;
   spr.fillScreen(TFT_WHITE);
-  return spr.drawJpg(buf, (uint32_t)size, x, y, maxWidth, maxHeight);
+  if (isJpeg(buf, size)) {  // JPEG
+    return spr.drawJpg(buf, (uint32_t)size, x, y, maxWidth, maxHeight);
+  }
+  if (isPng(buf, size)) {  // PNG
+    return spr.drawPng(buf, (uint32_t)size, x, y, maxWidth, maxHeight);
+  }
+  return false;
 }
-
-// Load a whole file into the shared PSRAM jpg buffer and decode it.
-// Returns file size on success, 0 on failure.
-static size_t loadFileToJpgBuffer(const char *path);
 
 static bool forceFullMenuRedraw = true;
-
-static uint8_t *jpgBuffer = nullptr;
-static size_t jpgBufferSize = 0;
-
-void ensureJpgBuffer(size_t size) {
-  if (jpgBufferSize < size) {
-    if (jpgBuffer) heap_caps_free(jpgBuffer);
-    jpgBuffer = (uint8_t *)heap_caps_malloc(size, MALLOC_CAP_SPIRAM);
-    if (jpgBuffer)
-      jpgBufferSize = size;
-    else
-      jpgBufferSize = 0;
-  }
-}
-
-// Read entire file into the shared PSRAM buffer (grown as needed).
-// Returns bytes read, 0 on failure.
-static size_t loadFileToJpgBuffer(const char *path) {
-  FILE *f = fopen(path, "rb");
-  if (!f) return 0;
-  fseek(f, 0, SEEK_END);
-  long sz = ftell(f);
-  fseek(f, 0, SEEK_SET);
-  if (sz <= 0 || sz > 16 * 1024 * 1024) {
-    fclose(f);
-    return 0;
-  }
-  ensureJpgBuffer((size_t)sz + 1024);
-  if (!jpgBuffer) {
-    fclose(f);
-    return 0;
-  }
-  size_t n = fread(jpgBuffer, 1, (size_t)sz, f);
-  fclose(f);
-  return (n == (size_t)sz) ? n : 0;
-}
 
 void prepareSprite(LGFX_Sprite &sprite, int w, int h, int depth,
                    bool usePsram) {
@@ -356,57 +333,97 @@ void drawModernButton(LGFX_Sprite &sprite, int x, int y, int w, int h,
   sprite.setTextDatum(top_left);
 }
 
-static int lastOutX = -1, lastOutY = -1;
-
-void drawMagnifier(int x, int y, bool qualityMode) {
-  static LGFX_Sprite magSprite(&M5.Display);
-  prepareSprite(magSprite, MAG_SIZE, MAG_SIZE, 16, true);
-  if (!magSprite.getBuffer()) return;
-
-  int outX = x - MAG_SIZE / 2;
-  int outY = y - MAG_SIZE - 60;
-  if (outX < 10) outX = 10;
-  if (outX + MAG_SIZE > DISPLAY_W - 10) outX = DISPLAY_W - MAG_SIZE - 10;
-  if (outY < 10) outY = 10;
-
-  int srcSize = MAG_SIZE / MAG_SCALE;
-  int srcX = x, srcY = y;
-  if (srcX < srcSize / 2) srcX = srcSize / 2;
-  if (srcY < srcSize / 2) srcY = srcSize / 2;
-  if (srcX > DISPLAY_W - srcSize / 2) srcX = DISPLAY_W - srcSize / 2;
-  if (srcY > DISPLAY_H - srcSize / 2) srcY = DISPLAY_H - srcSize / 2;
-
-  magSprite.fillScreen(TFT_WHITE);
-  gSprite.setPivot(srcX, srcY);
-  gSprite.pushRotateZoom(&magSprite, MAG_SIZE / 2, MAG_SIZE / 2, 0, MAG_SCALE,
-                         MAG_SCALE);
-
-  magSprite.drawRect(0, 0, MAG_SIZE, MAG_SIZE, TFT_BLACK);
-  magSprite.drawRect(1, 1, MAG_SIZE - 2, MAG_SIZE - 2, TFT_WHITE);
-  magSprite.drawRect(2, 2, MAG_SIZE - 4, MAG_SIZE - 4, TFT_BLACK);
-
-  M5.Display.startWrite();
-  if (lastOutX != -1 && (lastOutX != outX || lastOutY != outY)) {
-    M5.Display.setEpdMode(epd_mode_t::epd_fast);
-    M5.Display.setClipRect(lastOutX, lastOutY, MAG_SIZE, MAG_SIZE);
-    gSprite.pushSprite(0, 0);
-    M5.Display.clearClipRect();
-  }
-
-  M5.Display.setEpdMode(qualityMode ? epd_mode_t::epd_quality
-                                    : epd_mode_t::epd_fast);
-  magSprite.pushSprite(outX, outY);
-
-  M5.Display.display();
-  M5.Display.endWrite();
-
-  lastOutX = outX;
-  lastOutY = outY;
+// Full-screen pinch-zoom view. Renders the zoomFactor-scaled page region
+// around (zoomCX, zoomCY) from gSprite (never modified here). Fastest while
+// gliding, quality once the finger stops.
+void clampZoomViewport() {
+  float vw = (float)DISPLAY_W / zoomFactor;
+  float vh = (float)DISPLAY_H / zoomFactor;
+  float minX = vw / 2, maxX = (float)DISPLAY_W - vw / 2;
+  float minY = vh / 2, maxY = (float)DISPLAY_H - vh / 2;
+  float cx = (minX > maxX) ? (float)DISPLAY_W / 2
+                           : std::min(std::max((float)zoomCX, minX), maxX);
+  float cy = (minY > maxY) ? (float)DISPLAY_H / 2
+                           : std::min(std::max((float)zoomCY, minY), maxY);
+  zoomCX = (int)cx;
+  zoomCY = (int)cy;
 }
 
-void resetMagnifierTracking() {
-  lastOutX = -1;
-  lastOutY = -1;
+void drawZoomed(bool qualityMode) {
+  static LGFX_Sprite zoomSprite(&M5.Display);
+  prepareSprite(zoomSprite, DISPLAY_W, DISPLAY_H, 16, true);
+  if (!zoomSprite.getBuffer() || !gSprite.getBuffer()) return;
+
+  gSprite.setPivot(zoomCX, zoomCY);
+  if (qualityMode)
+    gSprite.pushRotateZoomWithAA(&zoomSprite, DISPLAY_W / 2, DISPLAY_H / 2, 0,
+                                 zoomFactor, zoomFactor);
+  else
+    gSprite.pushRotateZoom(&zoomSprite, DISPLAY_W / 2, DISPLAY_H / 2, 0,
+                           zoomFactor, zoomFactor);
+
+  M5.Display.startWrite();
+  M5.Display.setEpdMode(qualityMode ? epd_mode_t::epd_quality
+                                    : epd_mode_t::epd_fastest);
+  zoomSprite.pushSprite(0, 0);
+  M5.Display.display();
+  M5.Display.endWrite();
+}
+
+// Cover thumbnail with a raw-pixel disk cache (see thumb.h). Returns true
+// when the frame was painted (caller prints NO COVER otherwise).
+// Fast path: validated fread + row memcpy, no decode. Slow path (first
+// sighting): decode page 0 fitted into a thumb sprite, persist it, blit.
+static bool drawCoverInto(LGFX_Sprite &dst, int x, int y,
+                          const std::string &entry) {
+  static_assert(THUMB_W - 4 == THUMB_IMG_W && THUMB_H - 4 == THUMB_IMG_H,
+                "thumb cache geometry must match the frame inner box");
+  uint32_t fsize = 0, fmtime = 0;
+  if (!bookCoverSource(entry, fsize, fmtime)) return false;
+
+  const int ox = x + 2, oy = y + 2;  // frame inner top-left
+  const std::string key = thumb_key_for(entry, fsize, fmtime);
+  uint8_t *dstBuf = (uint8_t *)dst.getBuffer();
+  if (!dstBuf) return false;
+
+  uint8_t *raw = (uint8_t *)heap_caps_malloc((size_t)THUMB_IMG_W * THUMB_IMG_H,
+                                             MALLOC_CAP_SPIRAM);
+  if (raw) {
+    if (thumb_load(key.c_str(), raw, THUMB_IMG_W, THUMB_IMG_H)) {
+      for (int r = 0; r < THUMB_IMG_H; r++)
+        memcpy(dstBuf + (oy + r) * dst.width() + ox, raw + r * THUMB_IMG_W,
+               THUMB_IMG_W);
+      heap_caps_free(raw);
+      return true;
+    }
+    heap_caps_free(raw);
+  }
+
+  // Miss: decode page 0 straight to thumbnail scale (M5GFX picks a small
+  // JPEGDIV, so this is cheaper than a full-res decode), persist, blit.
+  static LGFX_Sprite thumbSprite(&M5.Display);
+  prepareSprite(thumbSprite, THUMB_IMG_W, THUMB_IMG_H, 8, true);
+  if (!thumbSprite.getBuffer()) return false;
+  PageData pg = loadPageData(std::string(MANGA_ROOT) + "/" + entry, 0);
+  if (!pg.buf) return false;
+  thumbSprite.fillScreen(TFT_WHITE);
+  bool ok;
+  if (isPng(pg.buf, pg.size))
+    ok = thumbSprite.drawPng(pg.buf, (uint32_t)pg.size, 0, 0, THUMB_IMG_W,
+                             THUMB_IMG_H, 0, 0, 0.0f, 0.0f, middle_center);
+  else
+    ok = thumbSprite.drawJpg(pg.buf, (uint32_t)pg.size, 0, 0, THUMB_IMG_W,
+                             THUMB_IMG_H, 0, 0, 0.0f, 0.0f, middle_center);
+  freePageData(pg);
+  if (!ok) return false;
+  if (thumb_save(key.c_str(), (const uint8_t *)thumbSprite.getBuffer(),
+                 THUMB_IMG_W, THUMB_IMG_H))
+    thumb_maintain_cap();
+  const uint8_t *src = (const uint8_t *)thumbSprite.getBuffer();
+  for (int r = 0; r < THUMB_IMG_H; r++)
+    memcpy(dstBuf + (oy + r) * dst.width() + ox, src + r * THUMB_IMG_W,
+           THUMB_IMG_W);
+  return true;
 }
 
 void preloadPage(int page) {
@@ -420,7 +437,6 @@ void preloadPage(int page) {
   }
 
   setCpuFrequencyMhz(240);
-  std::string path = makePagePath(currentMangaPath, page);
 
   prepareSprite(nextPageSprite, DISPLAY_W, DISPLAY_H, 16, true);
   if (!nextPageSprite.getBuffer()) {
@@ -428,13 +444,11 @@ void preloadPage(int page) {
     return;
   }
 
-  size_t fileSize = loadFileToJpgBuffer(path.c_str());
-  if (fileSize == 0) {
-    isNextPageReady = false;
-    return;
-  }
-  bool success = decodeJpgToSprite(nextPageSprite, jpgBuffer, fileSize, 0, 0,
-                                    DISPLAY_W, DISPLAY_H);
+  PageData pg = loadPageData(currentMangaPath, page);
+  bool success = (pg.buf != nullptr) &&
+                 decodeImageToSprite(nextPageSprite, pg.buf, pg.size, 0, 0,
+                                     DISPLAY_W, DISPLAY_H);
+  freePageData(pg);
 
   if (success) {
     applyContrast(nextPageSprite);
@@ -529,18 +543,7 @@ void drawMenu() {
             menuCacheSprite.setTextDatum(top_left);
           } else {
             int fIdx = i - 2;
-            std::string coverPath = makePagePath(
-                std::string(MANGA_ROOT) + "/" + mangaFolders[fIdx], 0);
-            size_t coverSize = loadFileToJpgBuffer(coverPath.c_str());
-            if (coverSize > 0) {
-              // Fit covers of any aspect ratio into the frame, centered.
-              // (x, y) is the inner-box top-left; middle_center anchors the
-              // auto-fitted image inside it, and M5GFX clips to the fitted
-              // box so nothing can spill into the gutter or title.
-              menuCacheSprite.drawJpg(jpgBuffer, coverSize, x + 2, y + 2,
-                                      THUMB_W - 4, THUMB_H - 4, 0, 0, 0.0f,
-                                      0.0f, middle_center);
-            } else {
+            if (!drawCoverInto(menuCacheSprite, x, y, mangaFolders[fIdx])) {
               menuCacheSprite.setTextColor(UI_FG, UI_BG);
               menuCacheSprite.setFont(&fonts::DejaVu12);
               menuCacheSprite.setCursor(x + 10, y + THUMB_H / 2);
@@ -548,7 +551,7 @@ void drawMenu() {
             }
             menuCacheSprite.setFont(&fonts::DejaVu12);
             menuCacheSprite.setTextColor(UI_FG, UI_BG);
-            std::string title = mangaFolders[fIdx];
+            std::string title = displayName(mangaFolders[fIdx]);
             if (title.length() > 22) title = title.substr(0, 20) + "...";
 
             menuCacheSprite.setTextDatum(top_center);
@@ -588,7 +591,7 @@ void drawMenu() {
       menuCacheSprite.print("CONTINUE: ");
 
       menuCacheSprite.setFont(&fonts::DejaVu18);
-      std::string shortName = lastMangaName;
+      std::string shortName = displayName(lastMangaName);
       if (shortName.length() > 19) shortName = shortName.substr(0, 17) + "...";
       menuCacheSprite.print(shortName.c_str());
 
@@ -748,8 +751,8 @@ void systemShutdown() {
     if (gSprite.getBuffer()) {
       size_t sz = loadFileToJpgBuffer(path.c_str());
       if (sz > 0 &&
-          decodeJpgToSprite(gSprite, jpgBuffer, sz, 0, 0, DISPLAY_W,
-                            DISPLAY_H)) {
+          decodeImageToSprite(gSprite, jpgSharedBuffer(), sz, 0, 0,
+                              DISPLAY_W, DISPLAY_H)) {
         M5.Display.startWrite();
         gSprite.pushSprite(0, 0);
         M5.Display.display();
@@ -771,8 +774,8 @@ void drawBookConfig() {
   prepareSprite(gSprite, DISPLAY_W, DISPLAY_H, 8, true);
   if (!gSprite.getBuffer()) return;
   gSprite.fillScreen(TFT_MAGENTA);
-  int modW = 460;
-  int modH = 490;
+  int modW = BOOK_MOD_W;
+  int modH = BOOK_MOD_H;
   int modX = (DISPLAY_W - modW) / 2;
   int modY = (DISPLAY_H - modH) / 2;
 
@@ -792,42 +795,70 @@ void drawBookConfig() {
   gSprite.setTextDatum(top_left);
   gSprite.drawLine(modX, modY + 70, modX + modW, modY + 70, UI_BORDER);
 
-  int barY = modY + 85;
-  gSprite.drawRoundRect(modX + 20, barY, modW - 40, 80, UI_RADIUS, UI_BORDER);
+  int barY = modY + BOOK_PAGE_Y;
+  gSprite.drawRoundRect(modX + 20, barY, modW - 40, BOOK_PAGE_H, UI_RADIUS,
+                        UI_BORDER);
   gSprite.setFont(&fonts::DejaVu24);
-  gSprite.setCursor(modX + 45, barY + 25);
+  gSprite.setCursor(modX + 45, barY + 22);
   gSprite.print("<<");
-  gSprite.setCursor(modX + 115, barY + 25);
+  gSprite.setCursor(modX + 115, barY + 22);
   gSprite.print("<");
   std::string pg =
       std::to_string(bookConfigPendingPage + 1) + " / " + std::to_string(totalPages);
   int pgW = (int)pg.length() * 14;
-  gSprite.setCursor(modX + (modW - pgW) / 2, barY + 25);
+  gSprite.setCursor(modX + (modW - pgW) / 2, barY + 22);
   gSprite.print(pg.c_str());
-  gSprite.setCursor(modX + modW - 135, barY + 25);
+  gSprite.setCursor(modX + modW - 135, barY + 22);
   gSprite.print(">");
-  gSprite.setCursor(modX + modW - 85, barY + 25);
+  gSprite.setCursor(modX + modW - 85, barY + 22);
   gSprite.print(">>");
 
-  gSprite.drawLine(modX, modY + 180, modX + modW, modY + 180, UI_BORDER);
+  // Chapter stepper: "< Name (i/n) >" for multi-section CBZ, plain
+  // "NO CHAPTERS" otherwise. Jumps move the pending page to the
+  // neighboring chapter's first page (applied on close, like pages).
+  int chapY = modY + BOOK_CHAP_Y;
+  gSprite.drawRoundRect(modX + 20, chapY, modW - 40, BOOK_CHAP_H, UI_RADIUS,
+                        UI_BORDER);
+  const ChapterList &chapters = getChapters(currentMangaPath);
+  int chapIdx = chapterIndexForPage(currentMangaPath, bookConfigPendingPage);
+  gSprite.setFont(&fonts::DejaVu24);
+  gSprite.setCursor(modX + 45, chapY + 16);
+  gSprite.print("<");
+  gSprite.setCursor(modX + modW - 75, chapY + 16);
+  gSprite.print(">");
+  gSprite.setFont(&fonts::DejaVu18);
+  gSprite.setTextDatum(middle_center);
+  if (chapIdx >= 0) {
+    std::string label = chapters.names[(size_t)chapIdx] + " (" +
+                        std::to_string(chapIdx + 1) + "/" +
+                        std::to_string(chapters.names.size()) + ")";
+    if (label.length() > 24) label = label.substr(0, 22) + "...";
+    gSprite.drawString(label.c_str(), modX + modW / 2, chapY + BOOK_CHAP_H / 2);
+  } else {
+    gSprite.drawString("NO CHAPTERS", modX + modW / 2, chapY + BOOK_CHAP_H / 2);
+  }
+  gSprite.setTextDatum(top_left);
 
-  int btnW = modW - 60;
-  int btnX = modX + 30;
-  int btnH = 60;
+  gSprite.drawLine(modX, modY + BOOK_DIV_Y, modX + modW, modY + BOOK_DIV_Y,
+                   UI_BORDER);
 
-  int btnY0 = modY + 190;
+  int btnW = BOOK_BTN_W;
+  int btnX = modX + BOOK_BTN_XOFF;
+  int btnH = BOOK_BTN_H;
+
+  int btnY0 = modY + BOOK_BTN_DITHER_Y;
   std::string ditherMsg = std::string("DITHER: ") + ditherModeName();
   drawModernButton(gSprite, btnX, btnY0, btnW, btnH, ditherMsg.c_str(), false);
 
-  int btnY1 = modY + 260;
+  int btnY1 = modY + BOOK_BTN_CONTRAST_Y;
   std::string contrastMsg = std::string("CONTRAST: ") + contrastPresetName();
   drawModernButton(gSprite, btnX, btnY1, btnW, btnH, contrastMsg.c_str(),
                    false);
 
-  int btnY2 = modY + 330;
+  int btnY2 = modY + BOOK_BTN_BOOKMARK_Y;
   drawModernButton(gSprite, btnX, btnY2, btnW, btnH, "BOOKMARK PAGE", false);
 
-  int btnY3 = modY + 400;
+  int btnY3 = modY + BOOK_BTN_RETURN_Y;
   drawModernButton(gSprite, btnX, btnY3, btnW, btnH, "RETURN TO LIBRARY", true);
 
   M5.Display.startWrite();
@@ -848,7 +879,7 @@ void drawBookmarks() {
   if (selectedBookmarkFolder == "")
     gSprite.print("Bookmark Library");
   else {
-    std::string t = selectedBookmarkFolder;
+    std::string t = displayName(selectedBookmarkFolder);
     if (t.length() > 19) t = t.substr(0, 17) + "...";
     gSprite.printf("< %s", t.c_str());
   }
@@ -878,7 +909,7 @@ void drawBookmarks() {
         gSprite.setTextColor(UI_FG, UI_BG);
         gSprite.setFont(&fonts::DejaVu18);
         gSprite.setCursor(30, yOff + 30);
-        std::string t = uniqueFolders[i];
+        std::string t = displayName(uniqueFolders[i]);
         if (t.length() > 26) t = t.substr(0, 24) + "...";
         gSprite.print(t.c_str());
         gSprite.setFont(&fonts::DejaVu12);
@@ -994,9 +1025,8 @@ void drawPage() {
 
     isNextPageReady = false;
   } else {
-    std::string path = makePagePath(currentMangaPath, currentPage);
-    ESP_LOGI(TAG, "Drawing [%d/%d]: %s", currentPage + 1, totalPages,
-             path.c_str());
+    ESP_LOGI(TAG, "Drawing [%d/%d] page %d", currentPage + 1, totalPages,
+             currentPage);
 
     prepareSprite(gSprite, DISPLAY_W, DISPLAY_H, 16, true);
     if (!gSprite.getBuffer()) {
@@ -1005,14 +1035,15 @@ void drawPage() {
       return;
     }
 
-    size_t fileSize = loadFileToJpgBuffer(path.c_str());
-    if (fileSize == 0) {
+    PageData pg = loadPageData(currentMangaPath, currentPage);
+    if (!pg.buf) {
       setCpuFrequencyMhz(80);
       drawError("Cannot open image.");
       return;
     }
-    bool decodeSuccess = decodeJpgToSprite(gSprite, jpgBuffer, fileSize, 0,
-                                           0, DISPLAY_W, DISPLAY_H);
+    bool decodeSuccess = decodeImageToSprite(gSprite, pg.buf, pg.size, 0, 0,
+                                             DISPLAY_W, DISPLAY_H);
+    freePageData(pg);
 
     if (!decodeSuccess) {
       setCpuFrequencyMhz(80);

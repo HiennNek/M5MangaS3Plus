@@ -8,13 +8,16 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "esp_event.h"
+#include "esp_heap_caps.h"
 #include "esp_http_server.h"
 #include "esp_log.h"
 #include "esp_netif.h"
 #include "esp_wifi.h"
+#include "thumb.h"
 
 static const char *TAG = "wifi";
 static httpd_handle_t s_server = nullptr;
@@ -402,22 +405,33 @@ static esp_err_t handle_delete(httpd_req_t *req) {
     httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Bad length");
     return ESP_OK;
   }
-  std::string body;
-  body.resize(total);
+  // Body buffer in PSRAM: a 64KB DRAM string could fail to allocate
+  // under memory pressure (fatal without exceptions), and this handler
+  // runs while reader sprites occupy internal RAM.
+  char *raw = (char *)heap_caps_malloc(total + 1, MALLOC_CAP_SPIRAM);
+  if (!raw) {
+    httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "No memory");
+    return ESP_OK;
+  }
   size_t received = 0;
   while (received < total) {
-    int r = httpd_req_recv(req, body.data() + received, total - received);
+    int r = httpd_req_recv(req, raw + received, total - received);
     if (r <= 0) break;
     received += (size_t)r;
   }
+  raw[received] = '\0';
+  std::string_view body(raw, received);
   // Minimal JSON parse for {"paths":["/a", "/b"]}
   size_t lb = body.find('[');
   size_t rb = body.rfind(']');
-  if (lb == std::string::npos || rb == std::string::npos || rb <= lb) {
+  if (lb == std::string_view::npos || rb == std::string_view::npos ||
+      rb <= lb) {
+    heap_caps_free(raw);
     httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON");
     return ESP_OK;
   }
-  std::string inner = body.substr(lb + 1, rb - lb - 1);
+  std::string_view slice = body.substr(lb + 1, rb - lb - 1);
+  std::string inner(slice.data(), slice.size());
   size_t pos = 0;
   while (pos < inner.size()) {
     size_t q1 = inner.find('"', pos);
@@ -428,8 +442,15 @@ static esp_err_t handle_delete(httpd_req_t *req) {
     ESP_LOGI(TAG, "Deleting: %s", web.c_str());
     std::string fs = web_to_fs(web);
     rm_rf(fs);
+    // A removed top-level /manga/<entry> orphans its cached cover.
+    if (web.size() > 7 && web.compare(0, 7, "/manga/") == 0) {
+      std::string rest = web.substr(7);
+      if (!rest.empty() && rest.find('/') == std::string::npos)
+        thumb_purge_for(rest);
+    }
     pos = q2 + 1;
   }
+  heap_caps_free(raw);
   return httpd_resp_send(req, "OK", 2);
 }
 

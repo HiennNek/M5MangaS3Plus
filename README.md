@@ -18,6 +18,26 @@ USB-CDC console and the custom `partitions.csv` (15MB factory app).
 Dependencies (`m5stack/m5unified`, `m5stack/m5gfx`) come from the ESP
 component registry and are pinned in `dependencies.lock`.
 
+## Library layout (`/sdcard/manga/`)
+
+Each entry is either a folder of `m5_0000.jpg`, `m5_0001.jpg`, … files or a
+`.cbz` archive (ZIP with JPG/PNG images, any filenames, read in natural
+sort order). CBZ pages are extracted on demand straight to PSRAM — nothing
+is unpacked onto the SD card — using a minimal ZIP reader (`main/cbz.cpp`)
+with DEFLATE handled by the ESP32-S3 ROM tinfl. Encrypted, multi-disk and
+ZIP64 archives are refused. `.cbz` files can be uploaded via the WiFi file
+browser like any other file. CBZ pages grouped in top-level folders become
+navigable chapters: the Book Menu (swipe up from the bottom while reading)
+gains a `< Chapter (i/n) >` stepper below the page changer that jumps to the
+neighboring chapter's first page. Flat archives and folder books show
+`NO CHAPTERS` instead.
+
+Covers are cached per book in `/sdcard/.thumbs/` as pre-fitted 221x313
+8-bit raw dumps: the first menu visit decodes page 0 once, later visits do
+a single fread + memcpy with no image decode. Cache keys embed the cover's
+size+mtime for automatic invalidation (plus a format magic), orphans are
+purged on book delete and capped at 256 files.
+
 ## Porting notes (Arduino -> IDF)
 
 - `String` -> `std::string`; `File`/`SD.h` -> POSIX `fopen`/`opendir`/`stat`

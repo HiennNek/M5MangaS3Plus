@@ -18,8 +18,9 @@ bool bookConfigOpen = false;
 int bookConfigPendingPage = 0;
 DitherMode ditherMode = DITHER_FLOYD_STEINBERG;
 ContrastPreset contrastPreset = CONTRAST_NORMAL;
-bool isMagnifierActive = false;
-int magnifierX = 0, magnifierY = 0;
+bool isZoomed = false;
+float zoomFactor = 1.0f;
+int zoomCX = DISPLAY_W / 2, zoomCY = DISPLAY_H / 2;
 std::string selectedBookmarkFolder = "";
 epd_mode_t currentEpdMode = epd_mode_t::epd_fast;
 

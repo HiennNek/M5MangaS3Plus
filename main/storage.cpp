@@ -9,6 +9,8 @@
 #include <cstring>
 
 #include "compat.h"
+#include "cbz.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_vfs_fat.h"
 #include "nvs_flash.h"
@@ -84,12 +86,16 @@ void scanMangaFolders() {
     size_t slash = name.rfind('/');
     if (slash != std::string::npos) name = name.substr(slash + 1);
     if (name.empty() || name[0] == '.') continue;
-    // Confirm it is a directory.
+    // Folders and .cbz archives are both library entries.
     struct stat st = {};
     std::string full = std::string(MANGA_ROOT) + "/" + name;
-    if (stat(full.c_str(), &st) == 0 && S_ISDIR(st.st_mode)) {
+    if (stat(full.c_str(), &st) != 0) continue;
+    if (S_ISDIR(st.st_mode)) {
       mangaFolders.push_back(name);
       ESP_LOGI(TAG, "  Folder: %s", name.c_str());
+    } else if (S_ISREG(st.st_mode) && cbz_is_cbz_path(name)) {
+      mangaFolders.push_back(name);
+      ESP_LOGI(TAG, "  CBZ: %s", name.c_str());
     }
   }
   closedir(dir);
@@ -141,6 +147,130 @@ bool pageExists(const std::string &folder, int n) {
   return access(makePagePath(folder, n).c_str(), F_OK) == 0;
 }
 
+bool isCbzPath(const std::string &mangaPath) {
+  return cbz_is_cbz_path(mangaPath);
+}
+
+std::string displayName(const std::string &entry) {
+  if (entry.size() > 4 && cbz_is_cbz_path(entry))
+    return entry.substr(0, entry.size() - 4);
+  return entry;
+}
+
+bool bookCoverSource(const std::string &entry, uint32_t &fsize,
+                     uint32_t &fmtime) {
+  std::string base = std::string(MANGA_ROOT) + "/" + entry;
+  std::string p = isCbzPath(base) ? base : makePagePath(base, 0);
+  struct stat st = {};
+  if (stat(p.c_str(), &st) != 0 || !S_ISREG(st.st_mode)) return false;
+  fsize = (uint32_t)st.st_size;
+  fmtime = (uint32_t)st.st_mtime;
+  return true;
+}
+
+// Shared PSRAM buffer for folder pages (reused across pages/thumbnails).
+static uint8_t *jpgBuffer = nullptr;
+static size_t jpgBufferSize = 0;
+
+static void ensureJpgBuffer(size_t size) {
+  if (jpgBufferSize < size) {
+    if (jpgBuffer) heap_caps_free(jpgBuffer);
+    jpgBuffer = (uint8_t *)heap_caps_malloc(size, MALLOC_CAP_SPIRAM);
+    jpgBufferSize = jpgBuffer ? size : 0;
+  }
+}
+
+size_t loadFileToJpgBuffer(const char *path) {
+  FILE *f = fopen(path, "rb");
+  if (!f) return 0;
+  if (fseek(f, 0, SEEK_END) != 0) {
+    fclose(f);
+    return 0;
+  }
+  long sz = ftell(f);
+  if (sz <= 0 || sz > 16 * 1024 * 1024) {
+    fclose(f);
+    return 0;
+  }
+  rewind(f);
+  ensureJpgBuffer((size_t)sz + 1024);
+  if (!jpgBuffer) {
+    fclose(f);
+    return 0;
+  }
+  size_t n = fread(jpgBuffer, 1, (size_t)sz, f);
+  fclose(f);
+  return (n == (size_t)sz) ? n : 0;
+}
+
+uint8_t *jpgSharedBuffer() { return jpgBuffer; }
+
+// One-slot open-archive cache: reader and preloader hit the same book
+// back-to-back, so keep its parsed central directory around.
+static CbzArchive *s_cbz = nullptr;
+static std::string s_cbz_path;
+
+static CbzArchive *cbz_cached_open(const std::string &path) {
+  if (s_cbz && s_cbz_path == path) return s_cbz;
+  cbz_close(s_cbz);
+  s_cbz = nullptr;
+  s_cbz = cbz_open(path);
+  if (s_cbz) {
+    s_cbz_path = path;
+  } else {
+    s_cbz_path = "";
+  }
+  return s_cbz;
+}
+
+PageData loadPageData(const std::string &mangaPath, int page) {
+  PageData p;
+  if (page < 0) return p;
+  if (isCbzPath(mangaPath)) {
+    CbzArchive *a = cbz_cached_open(mangaPath);
+    if (a) p.size = cbz_extract(a, (size_t)page, &p.buf);
+    p.owned = (p.buf != nullptr);
+    return p;
+  }
+  p.size = loadFileToJpgBuffer(makePagePath(mangaPath, page).c_str());
+  p.buf = (p.size > 0) ? jpgBuffer : nullptr;
+  p.owned = false;
+  return p;
+}
+
+void freePageData(PageData &p) {
+  if (p.owned && p.buf) heap_caps_free(p.buf);
+  p.buf = nullptr;
+  p.size = 0;
+  p.owned = false;
+}
+
+static std::string s_chap_path;
+static ChapterList s_chapters;
+
+const ChapterList &getChapters(const std::string &mangaPath) {
+  if (mangaPath != s_chap_path) {
+    s_chapters.names.clear();
+    s_chapters.starts.clear();
+    s_chap_path = mangaPath;
+    if (isCbzPath(mangaPath)) {
+      if (CbzArchive *a = cbz_cached_open(mangaPath)) {
+        s_chapters = cbz_chapters(a);
+      }
+    }
+  }
+  return s_chapters;
+}
+
+int chapterIndexForPage(const std::string &mangaPath, int page) {
+  const ChapterList &ch = getChapters(mangaPath);
+  if (ch.names.empty()) return -1;
+  if (page < 0) page = 0;
+  auto it = std::upper_bound(ch.starts.begin(), ch.starts.end(), page);
+  int idx = (int)(it - ch.starts.begin()) - 1;
+  return (idx < 0) ? 0 : idx;
+}
+
 int findTotalPages(const std::string &folder) {
   static std::string cachedFolder = "";
   static int cachedCount = 0;
@@ -150,6 +280,16 @@ int findTotalPages(const std::string &folder) {
   if (count >= 0) {
     cachedFolder = folder;
     cachedCount = count;
+    return count;
+  }
+
+  if (isCbzPath(folder)) {
+    count = 0;
+    CbzArchive *a = cbz_cached_open(folder);
+    if (a) count = (int)a->images.size();
+    cachedFolder = folder;
+    cachedCount = count;
+    storeCachedPageCount(folder, count);
     return count;
   }
 
@@ -212,7 +352,11 @@ void loadProgress() {
     return;
   }
   size_t len = 0;
-  if (nvs_get_str(h, "lastPath", nullptr, &len) == ESP_OK && len > 0) {
+  // Cap: a corrupt NVS length must never drive a huge std::string alloc
+  // (allocation failure aborts — no exceptions in firmware). Paths here
+  // are always short "/sdcard/manga/<name>" strings.
+  if (nvs_get_str(h, "lastPath", nullptr, &len) == ESP_OK && len > 0 &&
+      len <= 512) {
     std::string tmp;
     tmp.resize(len);
     size_t out_len = len;

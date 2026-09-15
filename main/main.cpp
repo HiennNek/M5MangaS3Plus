@@ -36,11 +36,14 @@ void openMangaPath(const std::string &path, int page) {
   setCpuFrequencyMhz(240);
   uint32_t t0 = idf_millis();
   totalPages = findTotalPages(currentMangaPath);
-  ESP_LOGI(TAG, "Binary search found %d pages in %lu ms", totalPages,
+  ESP_LOGI(TAG, "Found %d pages in %lu ms", totalPages,
            (unsigned long)(idf_millis() - t0));
 
   if (totalPages == 0) {
-    drawError("No images found.\nExpected: m5_0000.jpg ...");
+    if (isCbzPath(currentMangaPath))
+      drawError("No images found in archive.");
+    else
+      drawError("No images found.\nExpected: m5_0000.jpg ...");
     idf_delay(2500);
     currentEpdMode = epd_mode_t::epd_fast;
     needRedraw = true;

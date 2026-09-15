@@ -28,8 +28,9 @@ extern bool bookConfigOpen;
 extern int bookConfigPendingPage;
 extern DitherMode ditherMode;
 extern ContrastPreset contrastPreset;
-extern bool isMagnifierActive;
-extern int magnifierX, magnifierY;
+extern bool isZoomed;
+extern float zoomFactor;
+extern int zoomCX, zoomCY;  // zoom viewport center, in page pixels
 extern std::string selectedBookmarkFolder;
 extern epd_mode_t currentEpdMode;
 

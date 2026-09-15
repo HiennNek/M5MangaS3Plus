@@ -21,11 +21,14 @@ idf_component_register(
         "ui.cpp"
         "input.cpp"
         "wifi_server.cpp"
+        "cbz.cpp"
+        "thumb.cpp"
     INCLUDE_DIRS
         "."
     PRIV_REQUIRES
         m5unified
         m5gfx
+        esp_rom
         nvs_flash
         esp_wifi
         esp_event

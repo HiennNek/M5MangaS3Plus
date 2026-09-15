@@ -45,13 +45,20 @@
 #define UI_BORDER TFT_BLACK
 #define UI_SHADOW TFT_BLACK
 
-#define MAG_SIZE 240
-#define MAG_SCALE 2
-
 // Touch gesture thresholds
 #define HEADER_H 100        // Height of header/top area that intercepts gestures
 #define SWIPE_HORIZ_MIN 60  // Minimum horizontal distance for a swipe
-#define LONG_PRESS_MS 600   // Milliseconds to trigger long-press (magnifier)
+
+// Pinch-zoom gesture tuning
+#define TAP_MAX_MS 300     // Max press duration to count as a tap
+#define DOUBLE_TAP_MS 400  // Max gap between taps (zoom toggle + settle timing)
+#define TAP_SLOP_PX 24     // Max movement to still count as a tap
+#define ZOOM_MIN 1.0f
+#define ZOOM_MAX 4.0f
+#define ZOOM_EXIT 1.05f    // Pinch closed past this exits zoom
+#define ZOOM_ENGAGE 1.2f   // Zoom must exceed this to count as "zoomed in"
+#define ZOOM_DOUBLE_TAP 2.0f  // Entry zoom factor for double-tap
+#define ZOOM_SETTLE_MS 300 // Still time before quality re-render while zoomed
 
 enum DitherMode {
   DITHER_OFF,
