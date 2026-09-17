@@ -665,10 +665,11 @@ void handleBookConfigTouch(const m5::touch_detail_t &t) {
   int btnX = modX + BOOK_BTN_XOFF;
   int btnH = BOOK_BTN_H;
 
-  int btnY0 = modY + BOOK_BTN_DITHER_Y;
+  int btnY0 = modY + BOOK_BTN_GRAY_Y;
   if (tapX >= btnX && tapX <= btnX + btnW && tapY >= btnY0 &&
       tapY <= btnY0 + btnH) {
-    ditherMode = (DitherMode)((ditherMode + 1) % DITHER_COUNT);
+    grayLevels = (grayLevels == 16) ? 8 : (grayLevels == 8) ? 4 : 16;
+    if (grayLevels != 16) contrastPreset = CONTRAST_NORMAL;
     isNextPageReady = false;
     requestRedraw();
     return;
@@ -677,6 +678,21 @@ void handleBookConfigTouch(const m5::touch_detail_t &t) {
   int btnY1 = modY + BOOK_BTN_CONTRAST_Y;
   if (tapX >= btnX && tapX <= btnX + btnW && tapY >= btnY1 &&
       tapY <= btnY1 + btnH) {
+    if (grayLevels != 16) {
+      M5.Display.startWrite();
+      M5.Display.fillRoundRect(btnX, btnY1, btnW, btnH, UI_RADIUS, UI_FG);
+      M5.Display.setTextColor(UI_BG, UI_FG);
+      M5.Display.setFont(&fonts::DejaVu18);
+      M5.Display.setTextDatum(middle_center);
+      M5.Display.drawString("16 LEVELS ONLY", btnX + btnW / 2,
+                            btnY1 + btnH / 2);
+      M5.Display.setTextDatum(top_left);
+      M5.Display.display();
+      M5.Display.endWrite();
+      idf_delay(50);
+      needRedraw = true;
+      return;
+    }
     contrastPreset = (ContrastPreset)((contrastPreset + 1) % CONTRAST_COUNT);
     isNextPageReady = false;
     requestRedraw();

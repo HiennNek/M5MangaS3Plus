@@ -76,6 +76,10 @@ class PatchTests(unittest.TestCase):
         self.assertIn("LUT_MAKE(1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1)",
                       cpp)  # Kindle eraser applied too
         self.assertNotIn(P.OLD_ERASER, cpp)
+        black = ("LUT_MAKE(1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1),")
+        white = ("LUT_MAKE(2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2),")
+        self.assertEqual(cpp.count(black), 2 + P.SOLID_BLACK_FRAMES)
+        self.assertEqual(cpp.count(white), 2 + P.SOLID_WHITE_FRAMES)
 
     def test_idempotent_rerun(self):
         rc1, _, cpp1, hpp1 = run_patch(FAKE_CPP_PRISTINE, FAKE_HPP)
@@ -103,12 +107,31 @@ class PatchTests(unittest.TestCase):
         self.assertIn("REFUSED", out)
         self.assertEqual(cpp, "garbage\n")  # untouched
 
-    def test_partial_state_refused(self):
+    def test_partial_state_completes(self):
+        # cpp already migrated, hpp untouched: the run finishes the pair.
         rc1, _, cpp_v2, _ = run_patch(FAKE_CPP_PRISTINE, FAKE_HPP)
         self.assertEqual(rc1, 0)
-        rc, out, _, _ = run_patch(cpp_v2, FAKE_HPP)
-        self.assertEqual(rc, 1)
-        self.assertIn("INCONSISTENT", out)
+        rc, out, cpp, hpp = run_patch(cpp_v2, FAKE_HPP)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("refreshStockWaveform", hpp)
+
+    def test_old_stock_migrates(self):
+        # Previous script version's tables are replaced by solid counts.
+        old_block = ("  // >>> M5MangaS3Plus stock waveform tables X.\n"
+                     "  // Pristine upstream copies for Y.\n"
+                     "  static constexpr const uint32_t lut_eraser_stock[] = {\n"
+                     "    0u,\n"
+                     "  };\n"
+                     "  static constexpr const uint32_t lut_quality_stock[] = {\n"
+                     "    0u,\n"
+                     "  };\n")
+        v1cpp = FAKE_CPP_V1.replace("#undef LUT_MAKE",
+                                    old_block + "#undef LUT_MAKE")
+        rc, out, cpp, _ = run_patch(v1cpp, FAKE_HPP)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("Solid clean-refresh copies", cpp)
+        self.assertNotIn("Pristine upstream copies", cpp)
+        self.assertEqual(cpp.count("lut_eraser_stock[] = {"), 1)
 
     def test_hpp_mismatch_refused(self):
         rc, out, _, _ = run_patch(FAKE_CPP_PRISTINE, "other\n",

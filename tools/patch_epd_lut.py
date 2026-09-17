@@ -12,14 +12,19 @@ method; the step/retire engine is untouched):
 
   1. Kindle tables (default boot behavior): lut_eraser/lut_quality hold a
      short black -> white -> image script (~18 scans).
-  2. Stock tables (on demand): lut_eraser_stock (3 steps, NOP dropped so
-     both eraser variants share the restart threshold) + lut_quality_stock
-     (full original 32 steps) are kept alongside.
+  2. Solid tables (on demand): lut_eraser_stock (long all-black saturate)
+     + lut_quality_stock (long all-white saturate, then the vendor gray
+     rows, then settle holds). The per-frame scan sweep is panel physics
+     and can't be removed, but holding each uniform drive lets the pigment
+     converge, so phases read as clean solids instead of moving bands.
   3. Panel_EPD::refreshStockWaveform(): waits for idle, parks every pixel
      at eraser step 0 (value kept as LUT index), and re-expands the LUT
-     from the STOCK tables. The next display() then runs one full
-     original-quality sequence ending on the new image. No switch-back:
-     the only caller is the power-off splash; reboot re-expands Kindle.
+     from the solid tables. The next display() then runs one full clean
+     sequence ending on the new image. No switch-back: the only caller is
+     the power-off splash; reboot re-expands the Kindle tables.
+
+Tune SOLID_*_FRAMES below and rebuild to experiment: more frames = more
+solid but slower; fewer = faster but the sweep may show again.
 
 Usage from the app (see fullRefresh() in main/ui.cpp):
   draw splash into gSprite (no display yet) -> refreshStockWaveform() ->
@@ -42,6 +47,7 @@ the pristine hashes, so fixtures can exercise every state.
 import hashlib
 import os
 import pathlib
+import re
 import sys
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -130,41 +136,69 @@ NEW_QUALITY = """  // >>> M5MangaS3Plus Kindle-style quality waveform (tools/pat
     0u,
   };"""
 
-# Pristine copies kept for the on-demand stock rebuild. The stock eraser
-# drops its NOP row so both eraser variants are 3 steps and the shared
-# restart threshold (lut_eraser_step) stays valid either way.
-STOCK_TABLES = """  // >>> M5MangaS3Plus stock waveform tables (tools/patch_epd_lut.py).
-  // Pristine upstream copies for Panel_EPD::refreshStockWaveform().
-  static constexpr const uint32_t lut_eraser_stock[] = {
-    LUT_MAKE(2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 1, 1),
-    LUT_MAKE(2, 2, 3, 3, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1),
-    0u,
-  };
-  static constexpr const size_t lut_eraser_stock_step =
-      sizeof(lut_eraser_stock) / sizeof(uint32_t);
-  static constexpr const uint32_t lut_quality_stock[] = {
-    LUT_MAKE(1, 1, 1, 1, 1, 1, 1, 2, 1, 2, 2, 1, 1, 1, 1, 1),
-    LUT_MAKE(2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2),
-    LUT_MAKE(2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2),
-    LUT_MAKE(1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1),
-    LUT_MAKE(1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1),
-    LUT_MAKE(1, 1, 1, 1, 1, 1, 1, 1, 2, 1, 1, 1, 1, 1, 1, 1),
-    LUT_MAKE(1, 1, 2, 2, 1, 1, 1, 2, 1, 2, 1, 1, 1, 1, 1, 3),
-    LUT_MAKE(1, 1, 1, 1, 1, 2, 1, 1, 2, 2, 1, 2, 1, 2, 2, 2),
-    LUT_MAKE(1, 1, 3, 2, 2, 1, 2, 2, 2, 2, 2, 2, 1, 1, 2, 2),
-    LUT_MAKE(3, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2),
-    LUT_MAKE(3, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2),
-    LUT_MAKE(1, 1, 1, 1, 3, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2),
-    LUT_MAKE(1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 3, 3, 2, 2, 2, 2),
-    LUT_MAKE(3, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 3),
-    LUT_MAKE(3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 2, 2, 2, 3),
-    ~0u, ~0u, ~0u, ~0u,
-    ~0u, ~0u, ~0u, ~0u,
-    ~0u, ~0u, ~0u, ~0u,
-    ~0u, ~0u, ~0u, ~0u,
-    0u,
-  };
-"""
+# --- Solid clean-refresh tuning (frames per phase) ---
+# Each frame is one full panel scan (~70ms). Uniform drives converge after
+# a few frames, so longer holds read as clean solids instead of sweeps.
+SOLID_BLACK_FRAMES = 8
+SOLID_WHITE_FRAMES = 8
+SOLID_HOLD_FRAMES = 4
+
+_BLACK_ROW = ("    LUT_MAKE(1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1),")
+_WHITE_ROW = ("    LUT_MAKE(2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2),")
+# Vendor-tuned 16-gray convergence rows (same as the Kindle table).
+_IMAGE_ROWS = [
+    "    LUT_MAKE(1, 1, 1, 1, 1, 1, 1, 1, 2, 1, 1, 1, 1, 1, 1, 1),",
+    "    LUT_MAKE(1, 1, 2, 2, 1, 1, 1, 2, 1, 2, 1, 1, 1, 1, 1, 3),",
+    "    LUT_MAKE(1, 1, 1, 1, 1, 2, 1, 1, 2, 2, 1, 2, 1, 2, 2, 2),",
+    "    LUT_MAKE(1, 1, 3, 2, 2, 1, 2, 2, 2, 2, 2, 2, 1, 1, 2, 2),",
+    "    LUT_MAKE(3, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2),",
+    "    LUT_MAKE(3, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2),",
+    "    LUT_MAKE(1, 1, 1, 1, 3, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2),",
+    "    LUT_MAKE(1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 3, 3, 2, 2, 2, 2),",
+    "    LUT_MAKE(3, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 3),",
+    "    LUT_MAKE(3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 2, 2, 2, 3),",
+]
+
+
+def _hold_lines():
+    lines, left = [], SOLID_HOLD_FRAMES
+    while left > 0:
+        n = min(4, left)
+        lines.append("    " + ", ".join(["~0u"] * n) + ",")
+        left -= n
+    return lines
+
+
+def _build_stock_tables():
+    lines = [
+        "  // >>> M5MangaS3Plus stock waveform tables (tools/patch_epd_lut.py).",
+        "  // Solid clean-refresh copies for Panel_EPD::refreshStockWaveform():",
+        "  // long all-black saturate, long all-white saturate, vendor gray",
+        "  // rows, then settle holds. Frame counts from SOLID_*_FRAMES.",
+        "  static constexpr const uint32_t lut_eraser_stock[] = {",
+        *([_BLACK_ROW] * SOLID_BLACK_FRAMES),
+        "    0u,",
+        "  };",
+        "  static constexpr const size_t lut_eraser_stock_step =",
+        "      sizeof(lut_eraser_stock) / sizeof(uint32_t);",
+        "  static constexpr const uint32_t lut_quality_stock[] = {",
+        *([_WHITE_ROW] * SOLID_WHITE_FRAMES),
+        *_IMAGE_ROWS,
+        *_hold_lines(),
+        "    0u,",
+        "  };",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+STOCK_TABLES = _build_stock_tables()
+
+# Matches a previously injected stock-tables block (whatever its row counts)
+# for migration to the current generated text.
+OLD_STOCK_RE = re.compile(
+    r"  // >>> M5MangaS3Plus stock waveform tables.*?"
+    r"lut_quality_stock\[\] = \{\n.*?\n  \};\n",
+    re.DOTALL)
 
 ENGINE_METHOD = """  // >>> M5MangaS3Plus stock waveform one-shot (tools/patch_epd_lut.py).
   // Rebuilds the expanded LUT from the STOCK tables and parks every pixel
@@ -247,20 +281,17 @@ def main() -> int:
     cpp = EPD_CPP.read_text()
     hpp = EPD_HPP.read_text()
 
-    cpp_v2, hpp_v2 = MARKER_V2 in cpp, MARKER_V2 in hpp
-    if cpp_v2 and hpp_v2:
+    has_solid = "Solid clean-refresh copies" in cpp
+    has_decl = MARKER_V2 in hpp
+    if has_solid and has_decl:
         print("EPD patch: already applied, skipping.")
         return 0
-    if cpp_v2 != hpp_v2:
-        print("EPD patch: INCONSISTENT state (one file patched, one not). "
-              "Run `idf.py fullclean` and rebuild.")
-        return 1
 
     if MARKER_V1 not in cpp:
         if sha256(EPD_CPP) != EXPECTED_PRISTINE_CPP:
             print("EPD patch: REFUSED - Panel_EPD.cpp hash mismatch.\n"
-                  f"  M5GFX was probably updated; re-verify anchors and "
-                  f"update EXPECTED_PRISTINE_CPP in tools/patch_epd_lut.py.")
+                  "  M5GFX was probably updated; re-verify anchors and "
+                  "update EXPECTED_PRISTINE_CPP in tools/patch_epd_lut.py.")
             return 1
         for name, old, new in (("lut_eraser", OLD_ERASER, NEW_ERASER),
                                ("lut_quality", OLD_QUALITY, NEW_QUALITY)):
@@ -268,35 +299,48 @@ def main() -> int:
             if cpp is None:
                 return 1
 
-    # Stock tables + engine method (both input states reach here).
-    r = replace_once(cpp, "#undef LUT_MAKE",
-                     STOCK_TABLES + "#undef LUT_MAKE", "stock tables")
-    if r is None:
-        return 1
-    cpp = r
-    r = replace_once(cpp, "  void Panel_EPD::beginTransaction(void)",
-                     ENGINE_METHOD + "  void Panel_EPD::beginTransaction(void)",
-                     "engine method")
-    if r is None:
-        return 1
-    cpp = r
+    # Stock tables: migrate an older injected block, or insert fresh.
+    if not has_solid:
+        m = OLD_STOCK_RE.search(cpp)
+        if m:
+            cpp = cpp[:m.start()] + STOCK_TABLES + cpp[m.end():]
+        elif "lut_eraser_stock" not in cpp:
+            r = replace_once(cpp, "#undef LUT_MAKE",
+                             STOCK_TABLES + "#undef LUT_MAKE", "stock tables")
+            if r is None:
+                return 1
+            cpp = r
+        else:
+            print("EPD patch: unrecognized stock-tables state, aborting.\n"
+                  "  Run `idf.py fullclean` and rebuild.")
+            return 1
 
-    if sha256(EPD_HPP) != EXPECTED_PRISTINE_HPP and MARKER_V2 not in hpp:
-        print("EPD patch: REFUSED - Panel_EPD.hpp hash mismatch.\n"
-              "  M5GFX was probably updated; re-verify anchors and update "
-              "EXPECTED_PRISTINE_HPP in tools/patch_epd_lut.py.")
-        return 1
-    r = replace_once(hpp, "    void setPowerSave(bool flg) override;",
-                     "    void setPowerSave(bool flg) override;\n" + HPP_DECL,
-                     "hpp decl")
-    if r is None:
-        return 1
-    hpp = r
+    if "void Panel_EPD::refreshStockWaveform(void)" not in cpp:
+        r = replace_once(
+            cpp, "  void Panel_EPD::beginTransaction(void)",
+            ENGINE_METHOD + "  void Panel_EPD::beginTransaction(void)",
+            "engine method")
+        if r is None:
+            return 1
+        cpp = r
+
+    if not has_decl:
+        if sha256(EPD_HPP) != EXPECTED_PRISTINE_HPP:
+            print("EPD patch: REFUSED - Panel_EPD.hpp hash mismatch.\n"
+                  "  M5GFX was probably updated; re-verify anchors and "
+                  "update EXPECTED_PRISTINE_HPP in tools/patch_epd_lut.py.")
+            return 1
+        r = replace_once(hpp, "    void setPowerSave(bool flg) override;",
+                         "    void setPowerSave(bool flg) override;\n" +
+                         HPP_DECL, "hpp decl")
+        if r is None:
+            return 1
+        hpp = r
 
     EPD_CPP.write_text(cpp)
     EPD_HPP.write_text(hpp)
-    print("EPD patch: Kindle tables + stock one-shot applied "
-          "(default ~18 scans; fullRefresh() runs the original ~36).")
+    print("EPD patch: Kindle tables + solid one-shot applied "
+          "(default ~18 scans; fullRefresh() runs the solid ~32).")
     return 0
 
 

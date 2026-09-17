@@ -9,6 +9,7 @@
 #include "bookmarks.h"
 #include "compat.h"
 #include "esp_heap_caps.h"
+#include "freertos/semphr.h"
 #include "esp_log.h"
 #include "esp_random.h"
 #include "icon.h"
@@ -22,11 +23,18 @@
 
 static const char *TAG = "ui";
 
-// Image decoding uses M5GFX's built-in codecs (no external JPEGDEC
-// component, which does not build on IDF 6.x). Format is sniffed from magic
-// bytes so CBZ entries work regardless of their file extension. Images are
-// decoded straight into the target sprite, then contrast/dithering runs on
-// the sprite buffer.
+// Vendored bitbank2/JPEGDEC (components/jpegdec): SIMD-accelerated JPEG
+// decoding on ESP32-S3. PNG stays on M5GFX's built-in decoder.
+#include <JPEGDEC.h>
+
+// One decoder per task: JPEGDEC keeps decode state in the object, and the
+// main task (page render) and the preload worker can decode concurrently.
+static JPEGDEC s_jpegMain;
+static JPEGDEC s_jpegWorker;
+
+// Image decoding: JPEG via JPEGDEC straight into the target sprite (format
+// is sniffed from magic bytes so CBZ entries work regardless of their file
+// extension), PNG via M5GFX. Then contrast/gray runs on the sprite buffer.
 static bool isJpeg(const uint8_t *buf, size_t size) {
   return size >= 2 && buf[0] == 0xFF && buf[1] == 0xD8;
 }
@@ -35,12 +43,72 @@ static bool isPng(const uint8_t *buf, size_t size) {
          buf[3] == 'G';
 }
 
-static bool decodeImageToSprite(LGFX_Sprite &spr, uint8_t *buf, size_t size,
-                                int x, int y, int maxWidth, int maxHeight) {
+struct JpegDrawContext {
+  LGFX_Sprite *spr;
+  int offsetX;
+  int offsetY;
+  int maxWidth;
+  int maxHeight;
+};
+
+// JPEGDEC emits RGB565 big-endian blocks, matching the sprite buffer
+// layout, so blocks are copied row by row with clipping (no conversion).
+static int drawMCU(JPEGDRAW *pDraw) {
+  auto *ctx = (JpegDrawContext *)pDraw->pUser;
+  LGFX_Sprite *spr = ctx->spr;
+  const int sprW = spr->width();
+  const int sprH = spr->height();
+
+  int cw = pDraw->iWidth;
+  int ch = pDraw->iHeight;
+  if (ctx->maxWidth > 0 && pDraw->x + cw > ctx->maxWidth)
+    cw = ctx->maxWidth - pDraw->x;
+  if (ctx->maxHeight > 0 && pDraw->y + ch > ctx->maxHeight)
+    ch = ctx->maxHeight - pDraw->y;
+  if (cw <= 0 || ch <= 0) return 1;
+
+  int outX = pDraw->x + ctx->offsetX;
+  int outY = pDraw->y + ctx->offsetY;
+  if (outX < 0) {
+    cw += outX;
+    outX = 0;
+  }
+  if (outY < 0) {
+    ch += outY;
+    outY = 0;
+  }
+  if (outX + cw > sprW) cw = sprW - outX;
+  if (outY + ch > sprH) ch = sprH - outY;
+  if (cw <= 0 || ch <= 0) return 1;
+
+  const uint16_t *pixels = pDraw->pPixels;
+  uint16_t *dst = (uint16_t *)spr->getBuffer();
+  for (int y = 0; y < ch; y++) {
+    memcpy(&dst[(outY + y) * sprW + outX], &pixels[y * pDraw->iWidth],
+           (size_t)cw * sizeof(uint16_t));
+  }
+  return 1;
+}
+
+static bool decodeJpegToSprite(JPEGDEC &dec, LGFX_Sprite &spr, uint8_t *buf,
+                               size_t size, int x, int y, int maxWidth,
+                               int maxHeight) {
+  JpegDrawContext ctx = {&spr, x, y, maxWidth, maxHeight};
+  if (!dec.openRAM(buf, (int)size, drawMCU)) return false;
+  dec.setPixelType(RGB565_BIG_ENDIAN);
+  dec.setUserPointer(&ctx);
+  const bool ok = dec.decode(0, 0, 0) != 0;
+  dec.close();
+  return ok;
+}
+
+static bool decodeImageToSprite(LGFX_Sprite &spr, JPEGDEC &dec, uint8_t *buf,
+                                size_t size, int x, int y, int maxWidth,
+                                int maxHeight) {
   if (!buf || size == 0) return false;
   spr.fillScreen(TFT_WHITE);
   if (isJpeg(buf, size)) {  // JPEG
-    return spr.drawJpg(buf, (uint32_t)size, x, y, maxWidth, maxHeight);
+    return decodeJpegToSprite(dec, spr, buf, size, x, y, maxWidth, maxHeight);
   }
   if (isPng(buf, size)) {  // PNG
     return spr.drawPng(buf, (uint32_t)size, x, y, maxWidth, maxHeight);
@@ -62,199 +130,8 @@ void prepareSprite(LGFX_Sprite &sprite, int w, int h, int depth,
   sprite.createSprite(w, h);
 }
 
-void applyFloydSteinberg(LGFX_Sprite &sprite) {
-  int w = sprite.width();
-  int h = sprite.height();
-  uint16_t *buf = (uint16_t *)sprite.getBuffer();
-  if (!buf) return;
-
-  // Error buffers for current and next row (initialized to 0)
-  int16_t *error_buf =
-      (int16_t *)heap_caps_calloc(w * 2, sizeof(int16_t), MALLOC_CAP_INTERNAL);
-  if (!error_buf) return;
-
-  int16_t *curr_err = error_buf;
-  int16_t *next_err = error_buf + w;
-
-  for (int y = 0; y < h; y++) {
-    for (int x = 0; x < w; x++) {
-      // LGFX RGB565 is Big-Endian on ESP32
-      uint16_t raw_pixel = buf[y * w + x];
-      uint16_t pixel = (raw_pixel >> 8) | (raw_pixel << 8);
-
-      // Extract RGB565 components
-      int32_t r = (pixel >> 11) << 3;
-      int32_t g = ((pixel >> 5) & 0x3F) << 2;
-      int32_t b = (pixel & 0x1F) << 3;
-
-      // Simple grayscale conversion (accurate enough for manga)
-      int32_t gray = (r * 306 + g * 601 + b * 117) >> 10;
-
-      // Add error from previous pixels
-      int32_t gray_with_err = gray + curr_err[x];
-      if (gray_with_err < 0)
-        gray_with_err = 0;
-      else if (gray_with_err > 255)
-        gray_with_err = 255;
-
-      // Quantize to 16 levels (0, 17, 34 ... 255)
-      int32_t quantized = ((gray_with_err + 8) / 17) * 17;
-      if (quantized > 255) quantized = 255;
-
-      int32_t err = gray_with_err - quantized;
-
-      // Pack quantized gray back to RGB565 (Big-Endian)
-      uint16_t q = (uint16_t)quantized;
-      uint16_t out_pixel = ((q >> 3) << 11) | ((q >> 2) << 5) | (q >> 3);
-      buf[y * w + x] = (out_pixel >> 8) | (out_pixel << 8);
-
-      // Floyd-Steinberg error distribution
-      if (x + 1 < w) curr_err[x + 1] += (err * 7) >> 4;
-      if (y + 1 < h) {
-        if (x > 0) next_err[x - 1] += (err * 3) >> 4;
-        next_err[x] += (err * 5) >> 4;
-        if (x + 1 < w) next_err[x + 1] += (err * 1) >> 4;
-      }
-    }
-    int16_t *tmp = curr_err;
-    curr_err = next_err;
-    next_err = tmp;
-    memset(next_err, 0, (size_t)w * sizeof(int16_t));
-  }
-
-  heap_caps_free(error_buf);
-}
-
-// Atkinson dithering — distributes only 6/8 of the error (not full),
-// producing higher contrast and sharper edges. Ideal for manga lineart.
-void applyAtkinson(LGFX_Sprite &sprite) {
-  int w = sprite.width();
-  int h = sprite.height();
-  uint16_t *buf = (uint16_t *)sprite.getBuffer();
-  if (!buf) return;
-
-  int16_t *error_buf =
-      (int16_t *)heap_caps_calloc(w * 3, sizeof(int16_t), MALLOC_CAP_INTERNAL);
-  if (!error_buf) return;
-
-  int16_t *row0 = error_buf;
-  int16_t *row1 = error_buf + w;
-  int16_t *row2 = error_buf + w * 2;
-
-  for (int y = 0; y < h; y++) {
-    for (int x = 0; x < w; x++) {
-      uint16_t raw_pixel = buf[y * w + x];
-      uint16_t pixel = (raw_pixel >> 8) | (raw_pixel << 8);
-      int32_t r = (pixel >> 11) << 3;
-      int32_t g = ((pixel >> 5) & 0x3F) << 2;
-      int32_t b = (pixel & 0x1F) << 3;
-      int32_t gray = (r * 306 + g * 601 + b * 117) >> 10;
-
-      int32_t gray_with_err = gray + row0[x];
-      if (gray_with_err < 0)
-        gray_with_err = 0;
-      else if (gray_with_err > 255)
-        gray_with_err = 255;
-
-      int32_t quantized = ((gray_with_err + 8) / 17) * 17;
-      if (quantized > 255) quantized = 255;
-
-      int32_t err = (gray_with_err - quantized) >> 3;
-
-      uint16_t q = (uint16_t)quantized;
-      uint16_t out_pixel = ((q >> 3) << 11) | ((q >> 2) << 5) | (q >> 3);
-      buf[y * w + x] = (out_pixel >> 8) | (out_pixel << 8);
-
-      if (x + 1 < w) row0[x + 1] += err;
-      if (x + 2 < w) row0[x + 2] += err;
-      if (y + 1 < h) {
-        if (x > 0) row1[x - 1] += err;
-        row1[x] += err;
-        if (x + 1 < w) row1[x + 1] += err;
-      }
-      if (y + 2 < h) {
-        row2[x] += err;
-      }
-    }
-    int16_t *tmp = row0;
-    row0 = row1;
-    row1 = row2;
-    row2 = tmp;
-    memset(row2, 0, (size_t)w * sizeof(int16_t));
-  }
-
-  heap_caps_free(error_buf);
-}
-
-// Ordered (Bayer 4x4) dithering — fastest, no error propagation.
-static const int8_t bayer4x4[4][4] = {
-    {-8, 0, -6, 2}, {4, -4, 6, -2}, {-5, 3, -7, 1}, {7, -1, 5, -3}};
-
-void applyOrderedBayer(LGFX_Sprite &sprite) {
-  int w = sprite.width();
-  int h = sprite.height();
-  uint16_t *buf = (uint16_t *)sprite.getBuffer();
-  if (!buf) return;
-
-  for (int y = 0; y < h; y++) {
-    for (int x = 0; x < w; x++) {
-      uint16_t raw_pixel = buf[y * w + x];
-      uint16_t pixel = (raw_pixel >> 8) | (raw_pixel << 8);
-      int32_t r = (pixel >> 11) << 3;
-      int32_t g = ((pixel >> 5) & 0x3F) << 2;
-      int32_t b = (pixel & 0x1F) << 3;
-      int32_t gray = (r * 306 + g * 601 + b * 117) >> 10;
-
-      gray += bayer4x4[y & 3][x & 3];
-      if (gray < 0)
-        gray = 0;
-      else if (gray > 255)
-        gray = 255;
-
-      int32_t quantized = ((gray + 8) / 17) * 17;
-      if (quantized > 255) quantized = 255;
-
-      uint16_t q = (uint16_t)quantized;
-      uint16_t out_pixel = ((q >> 3) << 11) | ((q >> 2) << 5) | (q >> 3);
-      buf[y * w + x] = (out_pixel >> 8) | (out_pixel << 8);
-    }
-  }
-}
-
-// Dispatcher — applies the selected dithering algorithm
-void applyDithering(LGFX_Sprite &sprite) {
-  switch (ditherMode) {
-    case DITHER_FLOYD_STEINBERG:
-      applyFloydSteinberg(sprite);
-      break;
-    case DITHER_ATKINSON:
-      applyAtkinson(sprite);
-      break;
-    case DITHER_ORDERED:
-      applyOrderedBayer(sprite);
-      break;
-    default:
-      break;
-  }
-}
-
-const char *ditherModeName() {
-  switch (ditherMode) {
-    case DITHER_OFF:
-      return "OFF";
-    case DITHER_FLOYD_STEINBERG:
-      return "FLOYD-STEINBERG";
-    case DITHER_ATKINSON:
-      return "ATKINSON";
-    case DITHER_ORDERED:
-      return "BAYER 4x4";
-    default:
-      return "UNKNOWN";
-  }
-}
-
-void applyContrast(LGFX_Sprite &sprite) {
-  if (contrastPreset == CONTRAST_NORMAL) return;
+void applyContrast(LGFX_Sprite &sprite, ContrastPreset preset) {
+  if (preset == CONTRAST_NORMAL) return;
 
   int w = sprite.width();
   int h = sprite.height();
@@ -262,7 +139,7 @@ void applyContrast(LGFX_Sprite &sprite) {
   if (!buf) return;
 
   int32_t contrast_fp, brightness;
-  switch (contrastPreset) {
+  switch (preset) {
     case CONTRAST_VIVID:
       contrast_fp = 307;
       brightness = 0;
@@ -301,6 +178,34 @@ void applyContrast(LGFX_Sprite &sprite) {
     uint16_t q = adjusted;
     uint16_t out = ((q >> 3) << 11) | ((q >> 2) << 5) | (q >> 3);
     buf[i] = (out >> 8) | (out << 8);
+    if ((i & 0xFFFF) == 0) vTaskDelay(1);
+  }
+}
+
+// Reduce to N evenly spaced gray levels (8 or 4). 16 (and anything
+// unexpected) is a no-op: those grays reach the 16-level panel as-is.
+void applyGrayLevels(LGFX_Sprite &sprite, int levels) {
+  if (levels != 8 && levels != 4) return;
+
+  int w = sprite.width();
+  int h = sprite.height();
+  uint16_t *buf = (uint16_t *)sprite.getBuffer();
+  if (!buf) return;
+
+  const int32_t steps = levels - 1;
+  for (int i = 0; i < w * h; i++) {
+    uint16_t raw = buf[i];
+    uint16_t pixel = (raw >> 8) | (raw << 8);
+    int32_t r = (pixel >> 11) << 3;
+    int32_t g = ((pixel >> 5) & 0x3F) << 2;
+    int32_t b = (pixel & 0x1F) << 3;
+    int32_t gray = (r * 306 + g * 601 + b * 117) >> 10;
+
+    int32_t level = (gray * steps + 127) / 255;
+    int32_t q = level * 255 / steps;
+    uint16_t out = ((q >> 3) << 11) | ((q >> 2) << 5) | (q >> 3);
+    buf[i] = (out >> 8) | (out << 8);
+    if ((i & 0xFFFF) == 0) vTaskDelay(1);
   }
 }
 
@@ -428,42 +333,158 @@ static bool drawCoverInto(LGFX_Sprite &dst, int x, int y,
   return true;
 }
 
-void preloadPage(int page) {
-  if (page < 0 || page >= totalPages) {
-    isNextPageReady = false;
-    return;
-  }
-  if (isNextPageReady && preloadedPage == page &&
-      preloadedMangaPath == currentMangaPath) {
-    return;
-  }
+// ---- Background page preloader -------------------------------------------
+// Decoding a page takes hundreds of ms; doing it on the main
+// task blacked out touch input between page turns. A worker task decodes
+// the *next* page into nextPageSprite while the main loop keeps polling
+// touch. Protocol (mutex held only for flag checks, never across decode):
+// the worker decodes only the latest request and publishes it only if the
+// request (path/page/settings) is still current; the main task consumes
+// only a matching ready page. Decode buffers and the archive handle below
+// are worker-private; nextPageSprite is never touched by both tasks at
+// once under this protocol.
+struct PreloadReq {
+  std::string path;
+  int page = -1;
+  uint32_t seq = 0;
+  ContrastPreset contrast = CONTRAST_NORMAL;
+  int gray = 16;
+};
 
-  setCpuFrequencyMhz(240);
+static SemaphoreHandle_t s_preMutex = nullptr;
+static TaskHandle_t s_preTask = nullptr;
+static PreloadReq s_req;
+static uint32_t s_reqSeq = 0;
+static bool s_preFallbackSync = false;
+
+static CbzArchive *s_preCbz = nullptr;  // worker-private archive handle
+static std::string s_preCbzPath;
+
+static bool ensurePreloader();
+
+// Worker-private file read (the shared loadFileToJpgBuffer belongs to the
+// main task). Returns bytes read into a fresh PSRAM buffer, 0 on failure.
+static size_t preloadReadFile(const char *path, uint8_t **out) {
+  *out = nullptr;
+  FILE *f = fopen(path, "rb");
+  if (!f) return 0;
+  if (fseek(f, 0, SEEK_END) != 0) {
+    fclose(f);
+    return 0;
+  }
+  long sz = ftell(f);
+  if (sz <= 0 || sz > 16 * 1024 * 1024) {
+    fclose(f);
+    return 0;
+  }
+  rewind(f);
+  uint8_t *buf = (uint8_t *)heap_caps_malloc((size_t)sz, MALLOC_CAP_SPIRAM);
+  if (!buf) {
+    fclose(f);
+    return 0;
+  }
+  size_t n = fread(buf, 1, (size_t)sz, f);
+  fclose(f);
+  if (n != (size_t)sz) {
+    heap_caps_free(buf);
+    return 0;
+  }
+  *out = buf;
+  return (size_t)sz;
+}
+
+void preloadPage(int page) {
+  if (!ensurePreloader()) return;  // worker unavailable: skip preloading
+  if (page < 0 || page >= totalPages) return;
+
+  xSemaphoreTake(s_preMutex, portMAX_DELAY);
+  const bool sameReady = isNextPageReady && preloadedPage == page &&
+                         preloadedMangaPath == currentMangaPath;
+  const bool inFlight =
+      (s_req.path == currentMangaPath && s_req.page == page);
+  if (!sameReady && !inFlight) {
+    s_req.path = currentMangaPath;
+    s_req.page = page;
+    s_req.seq = ++s_reqSeq;
+    s_req.contrast = contrastPreset;
+    s_req.gray = grayLevels;
+    xSemaphoreGive(s_preMutex);
+    xTaskNotifyGive(s_preTask);
+  } else {
+    xSemaphoreGive(s_preMutex);
+  }
+}
+
+// Decode one page into nextPageSprite on the worker task. Uses only
+// worker-private buffers and its own CBZ handle; the handoff globals are
+// published under s_preMutex only if the request is still current.
+static void preloadDecode(const PreloadReq &req) {
+  if (req.page < 0) return;
 
   prepareSprite(nextPageSprite, DISPLAY_W, DISPLAY_H, 16, true);
-  if (!nextPageSprite.getBuffer()) {
-    isNextPageReady = false;
-    return;
-  }
+  if (!nextPageSprite.getBuffer()) return;
 
-  PageData pg = loadPageData(currentMangaPath, page);
-  bool success = (pg.buf != nullptr) &&
-                 decodeImageToSprite(nextPageSprite, pg.buf, pg.size, 0, 0,
-                                     DISPLAY_W, DISPLAY_H);
-  freePageData(pg);
-
-  if (success) {
-    applyContrast(nextPageSprite);
-    if (ditherMode != DITHER_OFF) {
-      applyDithering(nextPageSprite);
+  uint8_t *buf = nullptr;
+  size_t size = 0;
+  if (isCbzPath(req.path)) {
+    if (!s_preCbz || s_preCbzPath != req.path) {
+      cbz_close(s_preCbz);
+      s_preCbz = cbz_open(req.path);
+      s_preCbzPath = s_preCbz ? req.path : std::string();
     }
-    preloadedPage = page;
-    preloadedMangaPath = currentMangaPath;
-    isNextPageReady = true;
+    if (s_preCbz) size = cbz_extract(s_preCbz, (size_t)req.page, &buf);
   } else {
-    isNextPageReady = false;
+    size = preloadReadFile(makePagePath(req.path, req.page).c_str(), &buf);
   }
-  setCpuFrequencyMhz(80);
+
+  bool ok = (buf != nullptr && size > 0) &&
+            decodeImageToSprite(nextPageSprite, s_jpegWorker, buf, size, 0,
+                                0, DISPLAY_W, DISPLAY_H);
+  if (buf) heap_caps_free(buf);
+  if (!ok) return;
+
+  applyContrast(nextPageSprite, req.contrast);
+  applyGrayLevels(nextPageSprite, req.gray);
+
+  xSemaphoreTake(s_preMutex, portMAX_DELAY);
+  if (req.seq == s_reqSeq && req.path == s_req.path &&
+      contrastPreset == req.contrast && grayLevels == req.gray) {
+    preloadedPage = req.page;
+    preloadedMangaPath = req.path;
+    isNextPageReady = true;
+  }
+  xSemaphoreGive(s_preMutex);
+}
+
+static void preloadTaskFn(void *arg) {
+  (void)arg;
+  for (;;) {
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);  // coalesces repeat requests
+    PreloadReq req;
+    xSemaphoreTake(s_preMutex, portMAX_DELAY);
+    req = s_req;
+    xSemaphoreGive(s_preMutex);
+    preloadDecode(req);
+  }
+}
+
+static bool ensurePreloader() {
+  if (s_preTask) return true;
+  if (s_preFallbackSync) return false;
+  s_preMutex = xSemaphoreCreateMutex();
+  if (!s_preMutex) {
+    s_preFallbackSync = true;
+    return false;
+  }
+  // Same core + priority as the main task: round-robin keeps touch
+  // polling live, and the EPD writer core stays undisturbed.
+  if (xTaskCreatePinnedToCore(preloadTaskFn, "preload", 12288, nullptr, 1,
+                              &s_preTask, xPortGetCoreID()) != pdPASS) {
+    s_preTask = nullptr;
+    s_preFallbackSync = true;
+    return false;
+  }
+  return true;
 }
 
 void drawMenu() {
@@ -767,8 +788,8 @@ void systemShutdown() {
     if (gSprite.getBuffer()) {
       size_t sz = loadFileToJpgBuffer(path.c_str());
       if (sz > 0 &&
-          decodeImageToSprite(gSprite, jpgSharedBuffer(), sz, 0, 0,
-                              DISPLAY_W, DISPLAY_H))
+          decodeImageToSprite(gSprite, s_jpegMain, jpgSharedBuffer(), sz, 0,
+                              0, DISPLAY_W, DISPLAY_H))
         haveImage = true;
     }
   }
@@ -863,9 +884,9 @@ void drawBookConfig() {
   int btnX = modX + BOOK_BTN_XOFF;
   int btnH = BOOK_BTN_H;
 
-  int btnY0 = modY + BOOK_BTN_DITHER_Y;
-  std::string ditherMsg = std::string("DITHER: ") + ditherModeName();
-  drawModernButton(gSprite, btnX, btnY0, btnW, btnH, ditherMsg.c_str(), false);
+  int btnY0 = modY + BOOK_BTN_GRAY_Y;
+  std::string grayMsg = std::string("GRAY: ") + std::to_string(grayLevels);
+  drawModernButton(gSprite, btnX, btnY0, btnW, btnH, grayMsg.c_str(), false);
 
   int btnY1 = modY + BOOK_BTN_CONTRAST_Y;
   std::string contrastMsg = std::string("CONTRAST: ") + contrastPresetName();
@@ -1033,14 +1054,25 @@ void drawPage() {
 
   setCpuFrequencyMhz(240);
 
-  if (isNextPageReady && preloadedPage == currentPage &&
-      preloadedMangaPath == currentMangaPath) {
+  bool usePreload = false;
+  if (ensurePreloader()) {
+    xSemaphoreTake(s_preMutex, portMAX_DELAY);
+    if (isNextPageReady && preloadedPage == currentPage &&
+        preloadedMangaPath == currentMangaPath) {
+      usePreload = true;
+    }
+    xSemaphoreGive(s_preMutex);
+  }
+
+  if (usePreload) {
     ESP_LOGI(TAG, "Instant turn for page %d", currentPage + 1);
 
     prepareSprite(gSprite, DISPLAY_W, DISPLAY_H, 16, true);
     nextPageSprite.pushSprite(&gSprite, 0, 0);
 
+    xSemaphoreTake(s_preMutex, portMAX_DELAY);
     isNextPageReady = false;
+    xSemaphoreGive(s_preMutex);
   } else {
     ESP_LOGI(TAG, "Drawing [%d/%d] page %d", currentPage + 1, totalPages,
              currentPage);
@@ -1058,8 +1090,9 @@ void drawPage() {
       drawError("Cannot open image.");
       return;
     }
-    bool decodeSuccess = decodeImageToSprite(gSprite, pg.buf, pg.size, 0, 0,
-                                             DISPLAY_W, DISPLAY_H);
+    bool decodeSuccess = decodeImageToSprite(gSprite, s_jpegMain, pg.buf,
+                                             pg.size, 0, 0, DISPLAY_W,
+                                             DISPLAY_H);
     freePageData(pg);
 
     if (!decodeSuccess) {
@@ -1067,10 +1100,8 @@ void drawPage() {
       drawError("Cannot decode image.");
       return;
     }
-    applyContrast(gSprite);
-    if (ditherMode != DITHER_OFF) {
-      applyDithering(gSprite);
-    }
+    applyContrast(gSprite, contrastPreset);
+    applyGrayLevels(gSprite, grayLevels);
   }
 
   M5.Display.startWrite();

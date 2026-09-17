@@ -46,9 +46,10 @@ purged on book delete and capped at 256 files.
 - `Preferences` -> NVS (`nvs_flash`, namespace `manga`: `lastPath`, `lastPage`).
 - `WiFi.h` + `WebServer` -> `esp_wifi` soft-AP + `esp_http_server`
   (streaming multipart upload parser, recursive delete, `mkdir -p`).
-- `JPEGDEC` (bitbank2, breaks on IDF 6 `-Werror`) dropped in favour of
-  M5GFX's built-in TJpgD (`sprite.drawJpg()`), then the same
-  contrast/dither pipeline runs on the sprite.
+- JPEG decode is bitbank2/JPEGDEC, vendored under `components/jpegdec`
+  (upstream `86282979`; ESP-IDF 6 `-Werror` fixes + S3-SIMD wiring documented
+  in its CMakeLists). Full-res pages render through it; PNG and thumbnails
+  stay on M5GFX's built-in codecs.
 - `millis`/`delay`/`random` -> `esp_timer_get_time`/`vTaskDelay`/`esp_random`
   (see `main/compat.h`); `setCpuFrequencyMhz()` is a no-op, clock scaling is
   left to `CONFIG_PM_ENABLE`.
@@ -59,7 +60,8 @@ purged on book delete and capped at 256 files.
   stock ~36-scan `lut_eraser`/`lut_quality` tables with a short black flash
   -> white -> image script (~18 scans). See the script header for tuning and
   revert instructions.
-- `fullRefresh()` (ui.cpp) renders through the *original* stock waveform
+- `fullRefresh()` (ui.cpp) renders through a *solid* full waveform
   for the power-off splash that persists on screen: the same script keeps
-  pristine copies plus a `Panel_EPD::refreshStockWaveform()` one-shot
-  (no switch-back needed; reboot re-expands the Kindle tables).
+  long-saturate black/white tables plus a `Panel_EPD::refreshStockWaveform()`
+  one-shot (frame counts tunable via `SOLID_*_FRAMES`). No switch-back is
+  needed; reboot re-expands the Kindle tables.

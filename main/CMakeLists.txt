@@ -28,6 +28,7 @@ idf_component_register(
     PRIV_REQUIRES
         m5unified
         m5gfx
+        jpegdec
         esp_rom
         nvs_flash
         esp_wifi

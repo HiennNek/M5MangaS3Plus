@@ -1,7 +1,8 @@
 #pragma once
 // Small Arduino -> ESP-IDF compatibility helpers for the M5MangaS3Plus port.
-// M5Unified/M5GFX/JPEGDEC come from the ESP Component Registry, everything
-// else uses native IDF APIs (FreeRTOS, esp_timer, NVS, SDMMC, esp_http_server).
+// M5Unified/M5GFX come from the ESP Component Registry (JPEGDEC is vendored
+// under components/jpegdec); everything else uses native IDF APIs
+// (FreeRTOS, esp_timer, NVS, SDMMC, esp_http_server).
 
 #include <algorithm>
 #include <cctype>

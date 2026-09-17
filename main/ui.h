@@ -17,7 +17,7 @@
 #define BOOK_BTN_XOFF 30
 #define BOOK_BTN_W (BOOK_MOD_W - 60)
 #define BOOK_BTN_H 60
-#define BOOK_BTN_DITHER_Y 255
+#define BOOK_BTN_GRAY_Y 255
 #define BOOK_BTN_CONTRAST_Y 325
 #define BOOK_BTN_BOOKMARK_Y 395
 #define BOOK_BTN_RETURN_Y 465
@@ -33,13 +33,11 @@ void drawPage();
 void preloadPage(int page);
 void drawZoomed(bool qualityMode);
 void clampZoomViewport();
-void applyFloydSteinberg(LGFX_Sprite &sprite);
-void applyAtkinson(LGFX_Sprite &sprite);
-void applyOrderedBayer(LGFX_Sprite &sprite);
-void applyDithering(LGFX_Sprite &sprite);
-const char *ditherModeName();
-void applyContrast(LGFX_Sprite &sprite);
+void applyContrast(LGFX_Sprite &sprite, ContrastPreset preset);
 const char *contrastPresetName();
+// Quantize to N gray levels (8 or 4; 16 is a no-op — the panel renders
+// those natively). Applied after contrast.
+void applyGrayLevels(LGFX_Sprite &sprite, int levels);
 void drawError(const char *msg);
 void systemShutdown();
 // Full original-quality refresh of gSprite's current content (~36 scans,

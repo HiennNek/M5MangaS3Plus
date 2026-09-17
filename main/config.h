@@ -60,14 +60,6 @@
 #define ZOOM_DOUBLE_TAP 2.0f  // Entry zoom factor for double-tap
 #define ZOOM_SETTLE_MS 300 // Still time before quality re-render while zoomed
 
-enum DitherMode {
-  DITHER_OFF,
-  DITHER_FLOYD_STEINBERG,
-  DITHER_ATKINSON,
-  DITHER_ORDERED,
-  DITHER_COUNT  // Must be last — used for cycling
-};
-
 enum ContrastPreset {
   CONTRAST_NORMAL,
   CONTRAST_VIVID,  // +20% contrast — good all-rounder for e-ink

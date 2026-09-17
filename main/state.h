@@ -26,8 +26,8 @@ extern bool needRedraw;
 extern bool controlMenuOpen;
 extern bool bookConfigOpen;
 extern int bookConfigPendingPage;
-extern DitherMode ditherMode;
 extern ContrastPreset contrastPreset;
+extern int grayLevels;  // 16 (default), 8, or 4; contrast applies only at 16
 extern bool isZoomed;
 extern float zoomFactor;
 extern int zoomCX, zoomCY;  // zoom viewport center, in page pixels
