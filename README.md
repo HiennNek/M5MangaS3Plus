@@ -1,4 +1,4 @@
-# M5MangaS3 +
+# M5MangaS3 + (Unstable)
 A manga reader for M5PaperS3 - a fork of the old, unmaintained M5Manga.
 
 Pure ESP-IDF app (`main/`, entry `app_main` in `main/main.cpp`).
