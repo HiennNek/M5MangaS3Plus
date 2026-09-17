@@ -4,6 +4,9 @@
 .vscode/ipch
 .vscode/extensions.json
 ignore_*
+__pycache__/
+*.pyc
+*.pyo
 # ESP-IDF
 build/
 managed_components/
