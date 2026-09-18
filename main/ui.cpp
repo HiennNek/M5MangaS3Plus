@@ -118,6 +118,28 @@ static bool decodeImageToSprite(LGFX_Sprite &spr, JPEGDEC &dec, uint8_t *buf,
 
 static bool forceFullMenuRedraw = true;
 
+// 1:1 blit of an ICON_SIZE grayscale icon (0=black, 255=white) with alpha
+// mask into an 8-bit sprite, blended over whatever is already there (the
+// card background) so no white box shows around the glyph.
+static void blitGrayIcon(LGFX_Sprite &dst, int x, int y,
+                         const unsigned char *px,
+                         const unsigned char *alpha) {
+  uint8_t *buf = (uint8_t *)dst.getBuffer();
+  if (!buf) return;
+  for (int r = 0; r < ICON_SIZE; r++) {
+    uint8_t *row = buf + (y + r) * dst.width() + x;
+    const unsigned char *srow = px + r * ICON_SIZE;
+    const unsigned char *arow = alpha + r * ICON_SIZE;
+    for (int c = 0; c < ICON_SIZE; c++) {
+      uint8_t a = arow[c];
+      if (a == 255)
+        row[c] = srow[c];
+      else if (a != 0)
+        row[c] = (uint8_t)((srow[c] * a + row[c] * (255 - a) + 127) / 255);
+    }
+  }
+}
+
 void prepareSprite(LGFX_Sprite &sprite, int w, int h, int depth,
                    bool usePsram) {
   if (sprite.width() == w && sprite.height() == h &&
@@ -499,24 +521,17 @@ void drawMenu() {
     prepareSprite(menuCacheSprite, DISPLAY_W, DISPLAY_H, 8, true);
     if (menuCacheSprite.getBuffer()) {
       menuCacheSprite.fillScreen(UI_BG);
-      menuCacheSprite.drawLine(0, 80, DISPLAY_W, 80, UI_BORDER);
+      // Black header bar, white text (its bottom edge is the divider).
+      menuCacheSprite.fillRect(0, 0, DISPLAY_W, 80, UI_FG);
       menuCacheSprite.setFont(&fonts::DejaVu24);
-      menuCacheSprite.setTextColor(UI_FG, UI_BG);
-      menuCacheSprite.setCursor(GRID_GUTTER, 30);
+      menuCacheSprite.setTextColor(UI_BG, UI_FG);
+      menuCacheSprite.setCursor(GRID_GUTTER, 19);
       menuCacheSprite.print("Library");
 
       menuCacheSprite.setFont(&fonts::DejaVu12);
-      menuCacheSprite.setTextColor(UI_FG, UI_BG);
-      menuCacheSprite.setCursor(GRID_GUTTER, 60);
+      menuCacheSprite.setTextColor(UI_BG, UI_FG);
+      menuCacheSprite.setCursor(GRID_GUTTER, 49);
       menuCacheSprite.printf("%d titles available", (int)mangaFolders.size());
-
-      if (totalItems > 0) {
-        int curPg = (menuScroll / MENU_VISIBLE) + 1;
-        int maxPg = (totalItems + MENU_VISIBLE - 1) / MENU_VISIBLE;
-        menuCacheSprite.setTextColor(UI_FG, UI_BG);
-        menuCacheSprite.setCursor(DISPLAY_W - 100, 30);
-        menuCacheSprite.printf("Pg %d/%d", curPg, maxPg);
-      }
 
       if (mangaFolders.empty()) {
         menuCacheSprite.setFont(&fonts::DejaVu18);
@@ -539,11 +554,9 @@ void drawMenu() {
           if (i == 0) {
             menuCacheSprite.fillRoundRect(x + 10, y + 10, THUMB_W - 20,
                                           THUMB_H - 20, UI_RADIUS, UI_ACCENT);
-            int iconX = x + (THUMB_W - 96) / 2;
-            int iconY = y + (THUMB_H - 96) / 2;
-            menuCacheSprite.drawBitmap(iconX, iconY,
-                                       image_book_70dp_1F1F1F_bits, 96, 96,
-                                       UI_FG);
+            blitGrayIcon(menuCacheSprite, x + (THUMB_W - ICON_SIZE) / 2,
+                         y + (THUMB_H - ICON_SIZE) / 2, icon_bookmarks_128,
+                         icon_bookmarks_128_alpha);
             menuCacheSprite.setFont(&fonts::DejaVu12);
             menuCacheSprite.setTextColor(UI_FG, UI_BG);
             menuCacheSprite.setTextDatum(top_center);
@@ -553,11 +566,9 @@ void drawMenu() {
           } else if (i == 1) {
             menuCacheSprite.fillRoundRect(x + 10, y + 10, THUMB_W - 20,
                                           THUMB_H - 20, UI_RADIUS, UI_ACCENT);
-            int iconX = x + (THUMB_W - 96) / 2;
-            int iconY = y + (THUMB_H - 96) / 2;
-            menuCacheSprite.drawBitmap(
-                iconX, iconY, image_drive_folder_upload_70dp_1F1F1F_bits, 96,
-                96, UI_FG);
+            blitGrayIcon(menuCacheSprite, x + (THUMB_W - ICON_SIZE) / 2,
+                         y + (THUMB_H - ICON_SIZE) / 2, icon_files_128,
+                         icon_files_128_alpha);
             menuCacheSprite.setFont(&fonts::DejaVu12);
             menuCacheSprite.setTextColor(UI_FG, UI_BG);
             menuCacheSprite.setTextDatum(top_center);
