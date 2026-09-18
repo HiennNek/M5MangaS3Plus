@@ -1,6 +1,7 @@
 #include "storage.h"
 
 #include <dirent.h>
+#include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -37,7 +38,9 @@ void sdInit() {
   bus_cfg.sclk_io_num = (gpio_num_t)SD_SCK_PIN;
   bus_cfg.quadwp_io_num = -1;
   bus_cfg.quadhd_io_num = -1;
-  bus_cfg.max_transfer_sz = 4000;
+  // 4000 capped each SPI DMA transaction at ~7 sectors, which throttled
+  // the multi-block reads readFileToBuffer() now issues.
+  bus_cfg.max_transfer_sz = 32 * 1024;
 
   // SPI2_HOST is free on ESP32-S3 (SPI3 used by display via M5Unified).
   esp_err_t ret =
@@ -175,32 +178,76 @@ static size_t jpgBufferSize = 0;
 static void ensureJpgBuffer(size_t size) {
   if (jpgBufferSize < size) {
     if (jpgBuffer) heap_caps_free(jpgBuffer);
-    jpgBuffer = (uint8_t *)heap_caps_malloc(size, MALLOC_CAP_SPIRAM);
+    // 64-byte aligned: lets sdmmc DMA straight into PSRAM when it can, and
+    // keeps chunk pointers cache-line aligned for the bounce path below.
+    size = (size + 63) & ~(size_t)63;
+    jpgBuffer = (uint8_t *)heap_caps_aligned_alloc(64, size, MALLOC_CAP_SPIRAM);
     jpgBufferSize = jpgBuffer ? size : 0;
   }
 }
 
+// Bulk file read, replacing fread().
+//
+// Why not fread: FATFS reports st_blksize = CONFIG_FATFS_VFS_FSTAT_BLKSIZE,
+// which defaults to 0 -> newlib falls back to BLKSIZ = 128 bytes. So a
+// 600 KB page was pulled in ~4800 read() syscalls, and f_read() of 128
+// bytes never reaches its multi-sector direct path -- every 512-byte sector
+// went through fs->win as a separate single-block SD transaction (~1200 of
+// them). CHUNK-sized reads let FATFS hand whole runs of sectors to
+// disk_read() in one CMD18.
+//
+// The chunk buffer is internal + DMA-capable on purpose:
+// sdmmc_read_sectors() falls back to a one-sector-at-a-time loop for any
+// destination that fails esp_dma_is_buffer_alignment_satisfied(), and a
+// plain MALLOC_CAP_SPIRAM pointer usually does. Bouncing through internal
+// RAM costs one memcpy (~15 ms for 600 KB) and guarantees the fast path.
+#define SD_READ_CHUNK (32 * 1024)
+
+size_t readFileToBuffer(const char *path, uint8_t *dst, size_t size) {
+  if (!dst || size == 0) return 0;
+  int fd = open(path, O_RDONLY);
+  if (fd < 0) return 0;
+
+  uint8_t *chunk = (uint8_t *)heap_caps_aligned_alloc(
+      64, SD_READ_CHUNK, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+  size_t done = 0;
+
+  if (chunk) {
+    while (done < size) {
+      size_t want = size - done;
+      if (want > SD_READ_CHUNK) want = SD_READ_CHUNK;
+      ssize_t n = read(fd, chunk, want);
+      if (n <= 0) break;
+      memcpy(dst + done, chunk, (size_t)n);
+      done += (size_t)n;
+    }
+    heap_caps_free(chunk);
+  } else {
+    // No internal RAM for the bounce: read straight into the destination.
+    // Still far better than 128-byte stdio chunks.
+    while (done < size) {
+      size_t want = size - done;
+      if (want > SD_READ_CHUNK) want = SD_READ_CHUNK;
+      ssize_t n = read(fd, dst + done, want);
+      if (n <= 0) break;
+      done += (size_t)n;
+    }
+  }
+
+  close(fd);
+  return done;
+}
+
 size_t loadFileToJpgBuffer(const char *path) {
-  FILE *f = fopen(path, "rb");
-  if (!f) return 0;
-  if (fseek(f, 0, SEEK_END) != 0) {
-    fclose(f);
-    return 0;
-  }
-  long sz = ftell(f);
-  if (sz <= 0 || sz > 16 * 1024 * 1024) {
-    fclose(f);
-    return 0;
-  }
-  rewind(f);
-  ensureJpgBuffer((size_t)sz + 1024);
-  if (!jpgBuffer) {
-    fclose(f);
-    return 0;
-  }
-  size_t n = fread(jpgBuffer, 1, (size_t)sz, f);
-  fclose(f);
-  return (n == (size_t)sz) ? n : 0;
+  struct stat st = {};
+  if (stat(path, &st) != 0 || !S_ISREG(st.st_mode)) return 0;
+  if (st.st_size <= 0 || st.st_size > 16 * 1024 * 1024) return 0;
+
+  size_t sz = (size_t)st.st_size;
+  ensureJpgBuffer(sz + 1024);
+  if (!jpgBuffer) return 0;
+
+  return (readFileToBuffer(path, jpgBuffer, sz) == sz) ? sz : 0;
 }
 
 uint8_t *jpgSharedBuffer() { return jpgBuffer; }

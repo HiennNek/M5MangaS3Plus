@@ -1,6 +1,7 @@
 #include "ui.h"
 
 #include <dirent.h>
+#include <sys/stat.h>
 
 #include <algorithm>
 #include <cstdio>
@@ -43,12 +44,93 @@ static bool isPng(const uint8_t *buf, size_t size) {
          buf[3] == 'G';
 }
 
+// Page post-processing (contrast preset + gray-level quantization) used to
+// be two extra full-frame passes over the 540x960x16bpp sprite *in PSRAM*:
+// ~1 MB read + 1 MB written, twice, plus a vTaskDelay(1) every 64K pixels.
+// Both are pure per-pixel gray->gray maps, so they compose into one 256-entry
+// LUT that is applied inside drawMCU() while the block is still in internal
+// RAM. Same output, zero extra PSRAM traffic.
+// JPEGDEC now emits 8-bit luma (see decodeJpegToSprite), so the table maps
+// luma -> finished big-endian RGB565 sprite pixel in one indexed load: no
+// RGB unpack, no luma math, no second pass.
+struct PixelLut {
+  uint8_t map[256];
+};
+
+static inline int lumaToRgb565(int v) {
+  return ((v >> 3) << 11) | ((v >> 2) << 5) | (v >> 3);
+}
+static inline int rgb565ToLuma(int px) {
+  int r = (px >> 11) << 3, g = ((px >> 5) & 0x3F) << 2, b = (px & 0x1F) << 3;
+  return (r * 306 + g * 601 + b * 117) >> 10;
+}
+// What Panel_EPD stores for an rgb565 sprite pixel: swap565_t's R8/G8/B8 (bit
+// replication, not a plain shift) fed through grayscale_t(r,g,b), which is
+// (r + 2g + b) >> 2 -- a different weighting from the BT.601 luma above.
+// Baking this in is what keeps a grayscale sprite showing the same pixels the
+// rgb565 one did.
+static inline uint8_t rgb565ToPanelGray(int px) {
+  const int r5 = px >> 11, g6 = (px >> 5) & 0x3F, b5 = px & 0x1F;
+  const int gh = g6 >> 3, gl = g6 & 7;
+  const int r8 = (r5 << 3) + (r5 >> 2);
+  const int g8 = (((gh << 3) + gl) << 2) + (gh >> 1);
+  const int b8 = (b5 << 3) + (b5 >> 2);
+  return (uint8_t)((r8 + (g8 << 1) + b8) >> 2);
+}
+
+// Built stage for stage against the old pipeline -- JPEGDEC's luma->RGB565
+// table, then applyContrast, then applyGrayLevels -- including the lossy
+// 5/6/5 round-trip each stage used to go through. Skipping those round-trips
+// looks harmless but shifts values across quantization boundaries: at 4 gray
+// levels it moved 8 of 256 luma values a whole level.
+static void buildPixelLut(PixelLut &lut, ContrastPreset preset, int levels) {
+  const bool doContrast = (preset != CONTRAST_NORMAL);
+  const bool doLevels = (levels == 8 || levels == 4);
+
+  int32_t contrast_fp = 256, brightness = 0;
+  if (doContrast) {
+    switch (preset) {
+      case CONTRAST_VIVID:  contrast_fp = 307; brightness = 0;  break;
+      case CONTRAST_HIGH:   contrast_fp = 358; brightness = 5;  break;
+      case CONTRAST_LIGHT:  contrast_fp = 256; brightness = 30; break;
+      default: break;
+    }
+  }
+  const int32_t steps = doLevels ? (levels - 1) : 0;
+
+  for (int i = 0; i < 256; i++) {
+    int px = lumaToRgb565(i);
+    if (doContrast) {
+      int32_t v = (((rgb565ToLuma(px) - 128) * contrast_fp) >> 8) + 128 +
+                  brightness;
+      if (v < 0) v = 0;
+      else if (v > 255) v = 255;
+      px = lumaToRgb565((int)v);
+    }
+    if (doLevels) {
+      px = lumaToRgb565((int)(((int32_t)rgb565ToLuma(px) * steps + 127) / 255 *
+                              255 / steps));
+    }
+    lut.map[i] = rgb565ToPanelGray(px);
+  }
+}
+
+// Single-pass equivalent of applyContrast + applyGrayLevels for an 8-bit
+// page sprite (the PNG path; JPEG applies the LUT inside drawMCU).
+static void applyPixelLut(LGFX_Sprite &spr, const PixelLut &lut) {
+  uint8_t *buf = (uint8_t *)spr.getBuffer();
+  if (!buf) return;
+  const size_t n = (size_t)spr.width() * spr.height();
+  for (size_t i = 0; i < n; i++) buf[i] = lut.map[buf[i]];
+}
+
 struct JpegDrawContext {
   LGFX_Sprite *spr;
   int offsetX;
   int offsetY;
   int maxWidth;
   int maxHeight;
+  const PixelLut *lut;
 };
 
 // JPEGDEC emits RGB565 big-endian blocks, matching the sprite buffer
@@ -81,37 +163,86 @@ static int drawMCU(JPEGDRAW *pDraw) {
   if (outY + ch > sprH) ch = sprH - outY;
   if (cw <= 0 || ch <= 0) return 1;
 
-  const uint16_t *pixels = pDraw->pPixels;
-  uint16_t *dst = (uint16_t *)spr->getBuffer();
+  // iWidthUsed is the valid width of this block; iWidth is the buffer pitch
+  // and carries MCU padding past the right edge.
+  if (pDraw->iWidthUsed > 0 && cw > pDraw->iWidthUsed) cw = pDraw->iWidthUsed;
+  if (cw <= 0) return 1;
+
+  // Both sides are now 8-bit luma, so this is a byte-for-byte write into the
+  // sprite instead of the 2 bytes per pixel the rgb565 sprite needed.
+  const uint8_t *pixels = (const uint8_t *)pDraw->pPixels;  // iBpp == 8
+  uint8_t *dst = (uint8_t *)spr->getBuffer();
+  const uint8_t *map = ctx->lut->map;
+
   for (int y = 0; y < ch; y++) {
-    memcpy(&dst[(outY + y) * sprW + outX], &pixels[y * pDraw->iWidth],
-           (size_t)cw * sizeof(uint16_t));
+    const uint8_t *src = &pixels[y * pDraw->iWidth];
+    uint8_t *out = &dst[(outY + y) * sprW + outX];
+    for (int x = 0; x < cw; x++) out[x] = map[src[x]];
   }
   return 1;
 }
 
 static bool decodeJpegToSprite(JPEGDEC &dec, LGFX_Sprite &spr, uint8_t *buf,
                                size_t size, int x, int y, int maxWidth,
-                               int maxHeight) {
-  JpegDrawContext ctx = {&spr, x, y, maxWidth, maxHeight};
+                               int maxHeight, const PixelLut *lut) {
+  JpegDrawContext ctx = {&spr, x, y, maxWidth, maxHeight, lut};
   if (!dec.openRAM(buf, (int)size, drawMCU)) return false;
-  dec.setPixelType(RGB565_BIG_ENDIAN);
+
+  const int srcW = dec.getWidth(), srcH = dec.getHeight();
+
+  // Pick the cheapest power-of-two scale that still covers the target.
+  // The old code always ran a full-resolution decode and then had drawMCU
+  // throw away everything past 540x960, so an oversized page (any CBZ that
+  // was not pre-fitted) paid for 4x the IDCTs it could display.
+  int scale = 0, shift = 0;  // scale: 0 = 1:1
+  if (maxWidth > 0 && maxHeight > 0) {
+    if (srcW >= maxWidth * 8 && srcH >= maxHeight * 8) {
+      scale = JPEG_SCALE_EIGHTH; shift = 3;
+    } else if (srcW >= maxWidth * 4 && srcH >= maxHeight * 4) {
+      scale = JPEG_SCALE_QUARTER; shift = 2;
+    } else if (srcW >= maxWidth * 2 && srcH >= maxHeight * 2) {
+      scale = JPEG_SCALE_HALF; shift = 1;
+    }
+  }
+
+  // fillScreen() is a ~1 MB PSRAM memset. Only the region the page will not
+  // cover actually needs it.
+  const int outW = srcW >> shift, outH = srcH >> shift;
+  if (outW < spr.width() || outH < spr.height()) spr.fillScreen(TFT_WHITE);
+
+  // EIGHT_BIT_GRAYSCALE makes JPEGDEC huffman-skip the Cb/Cr blocks instead
+  // of dequantizing and IDCT-ing them (2 of 6 blocks per 4:2:0 MCU), drops
+  // the YCbCr->RGB565 conversion entirely, and fits twice as many MCUs per
+  // callback. The panel is 16-level gray, so none of that work was visible.
+  dec.setPixelType(EIGHT_BIT_GRAYSCALE);
   dec.setUserPointer(&ctx);
-  const bool ok = dec.decode(0, 0, 0) != 0;
+  const bool ok = dec.decode(0, 0, JPEG_LUMA_ONLY | scale) != 0;
   dec.close();
   return ok;
 }
 
+// JPEG folds contrast/gray into the MCU callback; PNG goes through M5GFX's
+// decoder (no callback to hook), so it keeps the old full-frame passes.
 static bool decodeImageToSprite(LGFX_Sprite &spr, JPEGDEC &dec, uint8_t *buf,
                                 size_t size, int x, int y, int maxWidth,
-                                int maxHeight) {
+                                int maxHeight,
+                                ContrastPreset preset = CONTRAST_NORMAL,
+                                int levels = 16) {
   if (!buf || size == 0) return false;
-  spr.fillScreen(TFT_WHITE);
-  if (isJpeg(buf, size)) {  // JPEG
-    return decodeJpegToSprite(dec, spr, buf, size, x, y, maxWidth, maxHeight);
+  if (isJpeg(buf, size)) {  // JPEG (clears only the uncovered margins)
+    PixelLut lut;
+    buildPixelLut(lut, preset, levels);
+    return decodeJpegToSprite(dec, spr, buf, size, x, y, maxWidth, maxHeight,
+                              &lut);
   }
+  spr.fillScreen(TFT_WHITE);
   if (isPng(buf, size)) {  // PNG
-    return spr.drawPng(buf, (uint32_t)size, x, y, maxWidth, maxHeight);
+    if (!spr.drawPng(buf, (uint32_t)size, x, y, maxWidth, maxHeight))
+      return false;
+    PixelLut lut;
+    buildPixelLut(lut, preset, levels);
+    applyPixelLut(spr, lut);  // one 8-bit pass, was two 16-bit ones
+    return true;
   }
   return false;
 }
@@ -140,8 +271,8 @@ static void blitGrayIcon(LGFX_Sprite &dst, int x, int y,
   }
 }
 
-void prepareSprite(LGFX_Sprite &sprite, int w, int h, int depth,
-                   bool usePsram) {
+void prepareSprite(LGFX_Sprite &sprite, int w, int h,
+                   lgfx::v1::color_depth_t depth, bool usePsram) {
   if (sprite.width() == w && sprite.height() == h &&
       sprite.getColorDepth() == depth) {
     return;
@@ -152,85 +283,9 @@ void prepareSprite(LGFX_Sprite &sprite, int w, int h, int depth,
   sprite.createSprite(w, h);
 }
 
-void applyContrast(LGFX_Sprite &sprite, ContrastPreset preset) {
-  if (preset == CONTRAST_NORMAL) return;
-
-  int w = sprite.width();
-  int h = sprite.height();
-  uint16_t *buf = (uint16_t *)sprite.getBuffer();
-  if (!buf) return;
-
-  int32_t contrast_fp, brightness;
-  switch (preset) {
-    case CONTRAST_VIVID:
-      contrast_fp = 307;
-      brightness = 0;
-      break;
-    case CONTRAST_HIGH:
-      contrast_fp = 358;
-      brightness = 5;
-      break;
-    case CONTRAST_LIGHT:
-      contrast_fp = 256;
-      brightness = 30;
-      break;
-    default:
-      return;
-  }
-
-  uint8_t lut[256];
-  for (int i = 0; i < 256; i++) {
-    int32_t val = (((i - 128) * contrast_fp) >> 8) + 128 + brightness;
-    if (val < 0)
-      val = 0;
-    else if (val > 255)
-      val = 255;
-    lut[i] = (uint8_t)val;
-  }
-
-  for (int i = 0; i < w * h; i++) {
-    uint16_t raw = buf[i];
-    uint16_t pixel = (raw >> 8) | (raw << 8);
-    int32_t r = (pixel >> 11) << 3;
-    int32_t g = ((pixel >> 5) & 0x3F) << 2;
-    int32_t b = (pixel & 0x1F) << 3;
-    int32_t gray = (r * 306 + g * 601 + b * 117) >> 10;
-
-    uint8_t adjusted = lut[gray];
-    uint16_t q = adjusted;
-    uint16_t out = ((q >> 3) << 11) | ((q >> 2) << 5) | (q >> 3);
-    buf[i] = (out >> 8) | (out << 8);
-    if ((i & 0xFFFF) == 0) vTaskDelay(1);
-  }
-}
-
-// Reduce to N evenly spaced gray levels (8 or 4). 16 (and anything
-// unexpected) is a no-op: those grays reach the 16-level panel as-is.
-void applyGrayLevels(LGFX_Sprite &sprite, int levels) {
-  if (levels != 8 && levels != 4) return;
-
-  int w = sprite.width();
-  int h = sprite.height();
-  uint16_t *buf = (uint16_t *)sprite.getBuffer();
-  if (!buf) return;
-
-  const int32_t steps = levels - 1;
-  for (int i = 0; i < w * h; i++) {
-    uint16_t raw = buf[i];
-    uint16_t pixel = (raw >> 8) | (raw << 8);
-    int32_t r = (pixel >> 11) << 3;
-    int32_t g = ((pixel >> 5) & 0x3F) << 2;
-    int32_t b = (pixel & 0x1F) << 3;
-    int32_t gray = (r * 306 + g * 601 + b * 117) >> 10;
-
-    int32_t level = (gray * steps + 127) / 255;
-    int32_t q = level * 255 / steps;
-    uint16_t out = ((q >> 3) << 11) | ((q >> 2) << 5) | (q >> 3);
-    buf[i] = (out >> 8) | (out << 8);
-    if ((i & 0xFFFF) == 0) vTaskDelay(1);
-  }
-}
-
+// applyContrast()/applyGrayLevels() are gone: they walked the sprite as
+// uint16_t and would silently corrupt an 8-bit page. buildPixelLut()
+// carries their exact behaviour now.
 const char *contrastPresetName() {
   switch (contrastPreset) {
     case CONTRAST_NORMAL:
@@ -280,7 +335,7 @@ void clampZoomViewport() {
 
 void drawZoomed(bool qualityMode) {
   static LGFX_Sprite zoomSprite(&M5.Display);
-  prepareSprite(zoomSprite, DISPLAY_W, DISPLAY_H, 16, true);
+  prepareSprite(zoomSprite, DISPLAY_W, DISPLAY_H, PAGE_DEPTH, true);
   if (!zoomSprite.getBuffer() || !gSprite.getBuffer()) return;
 
   gSprite.setPivot(zoomCX, zoomCY);
@@ -331,7 +386,7 @@ static bool drawCoverInto(LGFX_Sprite &dst, int x, int y,
   // Miss: decode page 0 straight to thumbnail scale (M5GFX picks a small
   // JPEGDIV, so this is cheaper than a full-res decode), persist, blit.
   static LGFX_Sprite thumbSprite(&M5.Display);
-  prepareSprite(thumbSprite, THUMB_IMG_W, THUMB_IMG_H, 8, true);
+  prepareSprite(thumbSprite, THUMB_IMG_W, THUMB_IMG_H, UI_DEPTH, true);
   if (!thumbSprite.getBuffer()) return false;
   PageData pg = loadPageData(std::string(MANGA_ROOT) + "/" + entry, 0);
   if (!pg.buf) return false;
@@ -388,31 +443,20 @@ static bool ensurePreloader();
 // main task). Returns bytes read into a fresh PSRAM buffer, 0 on failure.
 static size_t preloadReadFile(const char *path, uint8_t **out) {
   *out = nullptr;
-  FILE *f = fopen(path, "rb");
-  if (!f) return 0;
-  if (fseek(f, 0, SEEK_END) != 0) {
-    fclose(f);
-    return 0;
-  }
-  long sz = ftell(f);
-  if (sz <= 0 || sz > 16 * 1024 * 1024) {
-    fclose(f);
-    return 0;
-  }
-  rewind(f);
-  uint8_t *buf = (uint8_t *)heap_caps_malloc((size_t)sz, MALLOC_CAP_SPIRAM);
-  if (!buf) {
-    fclose(f);
-    return 0;
-  }
-  size_t n = fread(buf, 1, (size_t)sz, f);
-  fclose(f);
-  if (n != (size_t)sz) {
+  struct stat st = {};
+  if (stat(path, &st) != 0 || !S_ISREG(st.st_mode)) return 0;
+  if (st.st_size <= 0 || st.st_size > 16 * 1024 * 1024) return 0;
+
+  const size_t sz = (size_t)st.st_size;
+  uint8_t *buf = (uint8_t *)heap_caps_aligned_alloc(64, (sz + 63) & ~(size_t)63,
+                                                    MALLOC_CAP_SPIRAM);
+  if (!buf) return 0;
+  if (readFileToBuffer(path, buf, sz) != sz) {
     heap_caps_free(buf);
     return 0;
   }
   *out = buf;
-  return (size_t)sz;
+  return sz;
 }
 
 void preloadPage(int page) {
@@ -425,6 +469,10 @@ void preloadPage(int page) {
   const bool inFlight =
       (s_req.path == currentMangaPath && s_req.page == page);
   if (!sameReady && !inFlight) {
+    // The worker is about to overwrite nextPageSprite, so whatever was
+    // published for it is no longer safe to hand to the display. Matters
+    // more now that drawPage() swaps that sprite in rather than copying it.
+    isNextPageReady = false;
     s_req.path = currentMangaPath;
     s_req.page = page;
     s_req.seq = ++s_reqSeq;
@@ -443,7 +491,12 @@ void preloadPage(int page) {
 static void preloadDecode(const PreloadReq &req) {
   if (req.page < 0) return;
 
-  prepareSprite(nextPageSprite, DISPLAY_W, DISPLAY_H, 16, true);
+  // The worker never went through main.cpp's setCpuFrequencyMhz() brackets,
+  // so its decodes ran at the DFS minimum.
+  CpuBoost boost;
+  const int64_t tStart = esp_timer_get_time();
+
+  prepareSprite(nextPageSprite, DISPLAY_W, DISPLAY_H, PAGE_DEPTH, true);
   if (!nextPageSprite.getBuffer()) return;
 
   uint8_t *buf = nullptr;
@@ -459,14 +512,16 @@ static void preloadDecode(const PreloadReq &req) {
     size = preloadReadFile(makePagePath(req.path, req.page).c_str(), &buf);
   }
 
+  const int64_t tDec0 = esp_timer_get_time();
   bool ok = (buf != nullptr && size > 0) &&
             decodeImageToSprite(nextPageSprite, s_jpegWorker, buf, size, 0,
-                                0, DISPLAY_W, DISPLAY_H);
+                                0, DISPLAY_W, DISPLAY_H, req.contrast,
+                                req.gray);
   if (buf) heap_caps_free(buf);
   if (!ok) return;
-
-  applyContrast(nextPageSprite, req.contrast);
-  applyGrayLevels(nextPageSprite, req.gray);
+  ESP_LOGI(TAG, "preload %d: read %d ms, decode %d ms", req.page,
+           (int)((tDec0 - tStart) / 1000),
+           (int)((esp_timer_get_time() - tDec0) / 1000));
 
   xSemaphoreTake(s_preMutex, portMAX_DELAY);
   if (req.seq == s_reqSeq && req.path == s_req.path &&
@@ -518,7 +573,7 @@ void drawMenu() {
   int end = std::min(totalItems, menuScroll + MENU_VISIBLE);
 
   if (!menuCacheValid || lastDrawnMenuScroll != menuScroll) {
-    prepareSprite(menuCacheSprite, DISPLAY_W, DISPLAY_H, 8, true);
+    prepareSprite(menuCacheSprite, DISPLAY_W, DISPLAY_H, UI_DEPTH, true);
     if (menuCacheSprite.getBuffer()) {
       menuCacheSprite.fillScreen(UI_BG);
       // Black header bar, white text (its bottom edge is the divider).
@@ -708,7 +763,7 @@ void drawMenu() {
 
 void drawControlCenter() {
   forceFullMenuRedraw = true;
-  prepareSprite(gSprite, DISPLAY_W, DISPLAY_H, 8, true);
+  prepareSprite(gSprite, DISPLAY_W, DISPLAY_H, UI_DEPTH, true);
   if (!gSprite.getBuffer()) return;
   gSprite.fillScreen(TFT_MAGENTA);
   int modW = 500;
@@ -795,7 +850,7 @@ void systemShutdown() {
       path = std::string(PIC_ROOT) + "/" + path;
     else if (!str_starts_with(path, "/sdcard"))
       path = std::string(PIC_ROOT) + path;
-    prepareSprite(gSprite, DISPLAY_W, DISPLAY_H, 16, true);
+    prepareSprite(gSprite, DISPLAY_W, DISPLAY_H, PAGE_DEPTH, true);
     if (gSprite.getBuffer()) {
       size_t sz = loadFileToJpgBuffer(path.c_str());
       if (sz > 0 &&
@@ -805,7 +860,7 @@ void systemShutdown() {
     }
   }
   if (!haveImage) {
-    prepareSprite(gSprite, DISPLAY_W, DISPLAY_H, 16, true);
+    prepareSprite(gSprite, DISPLAY_W, DISPLAY_H, PAGE_DEPTH, true);
     if (gSprite.getBuffer()) gSprite.fillScreen(TFT_WHITE);
   }
   if (gSprite.getBuffer())
@@ -820,7 +875,7 @@ void systemShutdown() {
 
 void drawBookConfig() {
   forceFullMenuRedraw = true;
-  prepareSprite(gSprite, DISPLAY_W, DISPLAY_H, 8, true);
+  prepareSprite(gSprite, DISPLAY_W, DISPLAY_H, UI_DEPTH, true);
   if (!gSprite.getBuffer()) return;
   gSprite.fillScreen(TFT_MAGENTA);
   int modW = BOOK_MOD_W;
@@ -918,7 +973,7 @@ void drawBookConfig() {
 
 void drawBookmarks() {
   forceFullMenuRedraw = true;
-  prepareSprite(gSprite, DISPLAY_W, DISPLAY_H, 8, true);
+  prepareSprite(gSprite, DISPLAY_W, DISPLAY_H, UI_DEPTH, true);
   if (!gSprite.getBuffer()) return;
   gSprite.fillScreen(UI_BG);
   gSprite.drawLine(0, 80, DISPLAY_W, 80, UI_BORDER);
@@ -1019,7 +1074,7 @@ void drawBookmarks() {
 void drawWifiServer() {
   forceFullMenuRedraw = true;
   if (!isWifiServerRunning()) startWifiServer();
-  prepareSprite(gSprite, DISPLAY_W, DISPLAY_H, 8, true);
+  prepareSprite(gSprite, DISPLAY_W, DISPLAY_H, UI_DEPTH, true);
   if (!gSprite.getBuffer()) return;
   gSprite.fillScreen(UI_BG);
   gSprite.drawLine(0, 80, DISPLAY_W, 80, UI_BORDER);
@@ -1056,7 +1111,26 @@ void drawWifiServer() {
   M5.Display.endWrite();
 }
 
+// What prevPageSprite currently holds, and what is on screen. Settings are
+// part of the key: a contrast or gray-level change makes a kept page stale.
+static std::string s_prevPath, s_shownPath;
+static int s_prevPage = -1, s_shownPage = -1;
+static ContrastPreset s_prevContrast = CONTRAST_NORMAL,
+                      s_shownContrast = CONTRAST_NORMAL;
+static int s_prevGray = 16, s_shownGray = 16;
+
+static bool prevSlotMatches() {
+  return s_prevPage == currentPage && s_prevPath == currentMangaPath &&
+         s_prevContrast == contrastPreset && s_prevGray == grayLevels &&
+         prevPageSprite.getBuffer() != nullptr &&
+         prevPageSprite.getColorDepth() == PAGE_DEPTH;
+}
+
 void drawPage() {
+  // Held for the whole load: setCpuFrequencyMhz(80) on the early-return
+  // paths below would otherwise drop the clock mid-decode.
+  CpuBoost boost;
+
   forceFullMenuRedraw = true;
   if (totalPages == 0) {
     drawError("No images in this manga.");
@@ -1078,32 +1152,53 @@ void drawPage() {
   if (usePreload) {
     ESP_LOGI(TAG, "Instant turn for page %d", currentPage + 1);
 
-    prepareSprite(gSprite, DISPLAY_W, DISPLAY_H, 16, true);
-    nextPageSprite.pushSprite(&gSprite, 0, 0);
-
+    // Pointer rotation, not a full-frame copy. Under the mutex so the worker
+    // cannot be mid-publish, and the ready flag is cleared before it can be
+    // asked to start again.
     xSemaphoreTake(s_preMutex, portMAX_DELAY);
+    rotatePageSprites();
+    s_prevPath = s_shownPath;  // the page we just left is now in prevPageSprite
+    s_prevPage = s_shownPage;
+    s_prevContrast = s_shownContrast;
+    s_prevGray = s_shownGray;
     isNextPageReady = false;
     xSemaphoreGive(s_preMutex);
+    prepareSprite(gSprite, DISPLAY_W, DISPLAY_H, PAGE_DEPTH, true);
+  } else if (prevSlotMatches()) {
+    // Back-turn onto the page we just left: swap it in, no read, no decode.
+    ESP_LOGI(TAG, "Prev-slot hit for page %d", currentPage + 1);
+    swapPrevPageSprite();
+    s_prevPath = s_shownPath;
+    s_prevPage = s_shownPage;
+    s_prevContrast = s_shownContrast;
+    s_prevGray = s_shownGray;
   } else {
     ESP_LOGI(TAG, "Drawing [%d/%d] page %d", currentPage + 1, totalPages,
              currentPage);
 
-    prepareSprite(gSprite, DISPLAY_W, DISPLAY_H, 16, true);
+    prepareSprite(gSprite, DISPLAY_W, DISPLAY_H, PAGE_DEPTH, true);
     if (!gSprite.getBuffer()) {
       setCpuFrequencyMhz(80);
       drawError("Sprite alloc failed.");
       return;
     }
 
+    const int64_t tRead0 = esp_timer_get_time();
     PageData pg = loadPageData(currentMangaPath, currentPage);
     if (!pg.buf) {
       setCpuFrequencyMhz(80);
       drawError("Cannot open image.");
       return;
     }
+    const int64_t tDec0 = esp_timer_get_time();
     bool decodeSuccess = decodeImageToSprite(gSprite, s_jpegMain, pg.buf,
                                              pg.size, 0, 0, DISPLAY_W,
-                                             DISPLAY_H);
+                                             DISPLAY_H, contrastPreset,
+                                             grayLevels);
+    const int64_t tDec1 = esp_timer_get_time();
+    ESP_LOGI(TAG, "page %d: %u KB, read %d ms, decode %d ms", currentPage,
+             (unsigned)(pg.size / 1024), (int)((tDec0 - tRead0) / 1000),
+             (int)((tDec1 - tDec0) / 1000));
     freePageData(pg);
 
     if (!decodeSuccess) {
@@ -1111,18 +1206,30 @@ void drawPage() {
       drawError("Cannot decode image.");
       return;
     }
-    applyContrast(gSprite, contrastPreset);
-    applyGrayLevels(gSprite, grayLevels);
   }
 
+  // Kick the preloader *before* the refresh, not after. M5.Display.display()
+  // spends ~18 waveform scans driving the panel, most of it waiting on EPD
+  // timing rather than on the CPU, and the worker used to sit idle through
+  // all of it and only start once the user could already see the page.
+  //
+  // Direction matters too: the old code always preloaded currentPage + 1, so
+  // every turn while reading backwards was a guaranteed miss.
+  const bool backwards = (s_shownPage >= 0 && currentPage < s_shownPage);
+  s_shownPath = currentMangaPath;
+  s_shownPage = currentPage;
+  s_shownContrast = contrastPreset;
+  s_shownGray = grayLevels;
+  const int wanted = backwards ? currentPage - 1 : currentPage + 1;
+  if (wanted >= 0 && wanted < totalPages) preloadPage(wanted);
+
+  const int64_t tPush0 = esp_timer_get_time();
   M5.Display.startWrite();
   gSprite.pushSprite(0, 0);
   M5.Display.display();
   M5.Display.endWrite();
-
-  if (currentPage < totalPages - 1) {
-    preloadPage(currentPage + 1);
-  }
+  ESP_LOGI(TAG, "page %d: panel %d ms", currentPage,
+           (int)((esp_timer_get_time() - tPush0) / 1000));
 
   setCpuFrequencyMhz(80);
 }

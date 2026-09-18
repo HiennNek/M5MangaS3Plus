@@ -16,6 +16,7 @@ idf_component_register(
     SRCS
         "main.cpp"
         "state.cpp"
+        "cpufreq.cpp"
         "storage.cpp"
         "bookmarks.cpp"
         "ui.cpp"
@@ -40,6 +41,7 @@ idf_component_register(
         esp_driver_spi
         esp_driver_gpio
         esp_timer
+        esp_pm
         esp_psram
         heap
 )

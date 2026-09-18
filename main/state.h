@@ -34,8 +34,21 @@ extern int zoomCX, zoomCY;  // zoom viewport center, in page pixels
 extern std::string selectedBookmarkFolder;
 extern epd_mode_t currentEpdMode;
 
-extern LGFX_Sprite gSprite;
-extern LGFX_Sprite nextPageSprite;
+// Current / preloaded / previous page each live in an identical sprite.
+// Pages move between roles by exchanging pointers, never by copying. The
+// names stay usable as plain objects so call sites did not change.
+extern LGFX_Sprite *gSpritePtr;
+extern LGFX_Sprite *nextPageSpritePtr;
+extern LGFX_Sprite *prevPageSpritePtr;
+#define gSprite (*gSpritePtr)
+#define nextPageSprite (*nextPageSpritePtr)
+#define prevPageSprite (*prevPageSpritePtr)
+
+// Preloaded page becomes current; the outgoing page is kept in the third
+// slot instead of being recycled, so turning back does not decode again.
+void rotatePageSprites();
+// Current <-> previous, for a back-turn that hits the kept page.
+void swapPrevPageSprite();
 extern LGFX_Sprite menuCacheSprite;
 extern int lastDrawnMenuScroll;
 extern bool menuCacheValid;

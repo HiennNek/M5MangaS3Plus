@@ -20,7 +20,24 @@ CONFIG_SPIRAM_USE_CAPS_ALLOC=y
 
 CONFIG_FREERTOS_HZ=1000
 
+# S3 defaults to 160 MHz, and PM_DFS_INIT_AUTO uses it as max_freq_mhz.
+# Without this the CPU_FREQ_MAX lock in main/cpufreq.cpp only buys 160.
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+
+# 0 means newlib uses BLKSIZ (128 B) as the stdio buffer, so every fread()
+# path (CBZ extract, thumbnail cache) trickles the file in 128-byte reads
+# and FATFS never takes its multi-sector shortcut. Costs 8 KB per open file.
+CONFIG_FATFS_VFS_FSTAT_BLKSIZE=8192
+
 CONFIG_COMPILER_OPTIMIZATION_PERF=y
+
+# S3 cache defaults are 16 KB I / 32 KB D with 32-byte lines. The JPEG
+# decoder is a big hot loop executing from flash, and the sprite writes
+# stream through PSRAM, so both defaults cost real time here.
+CONFIG_ESP32S3_INSTRUCTION_CACHE_32KB=y
+CONFIG_ESP32S3_INSTRUCTION_CACHE_8WAYS=y
+CONFIG_ESP32S3_DATA_CACHE_64KB=y
+CONFIG_ESP32S3_DATA_CACHE_LINE_64B=y
 
 CONFIG_ESP_CONSOLE_USB_CDC=y
 CONFIG_ESP_CONSOLE_SECONDARY_NONE=y

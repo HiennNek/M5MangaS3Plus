@@ -33,11 +33,16 @@ void drawPage();
 void preloadPage(int page);
 void drawZoomed(bool qualityMode);
 void clampZoomViewport();
-void applyContrast(LGFX_Sprite &sprite, ContrastPreset preset);
+// Page sprites use PAGE_DEPTH: Panel_EPD's write depth is grayscale_8bit,
+// so a grayscale sprite pushes with no colour conversion and half the PSRAM
+// traffic of rgb565. Menus stay on rgb332 (PAGE_DEPTH is not a drop-in for
+// them -- their raw-gray icon blits assume the existing behaviour).
+#define PAGE_DEPTH lgfx::v1::color_depth_t::grayscale_8bit
+#define UI_DEPTH lgfx::v1::color_depth_t::rgb332_1Byte
+
+void prepareSprite(LGFX_Sprite &sprite, int w, int h,
+                   lgfx::v1::color_depth_t depth, bool usePsram);
 const char *contrastPresetName();
-// Quantize to N gray levels (8 or 4; 16 is a no-op — the panel renders
-// those natively). Applied after contrast.
-void applyGrayLevels(LGFX_Sprite &sprite, int levels);
 void drawError(const char *msg);
 void systemShutdown();
 // Full original-quality refresh of gSprite's current content (~36 scans,

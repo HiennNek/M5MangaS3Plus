@@ -32,6 +32,11 @@ idf_component_register(
     "shim"
 )
 
+# The decoder is the hot loop of a page turn and is small enough that the
+# extra inlining/unrolling is worth the flash. CONFIG_COMPILER_OPTIMIZATION_PERF
+# is only -O2, and it applies globally; this overrides it for this component.
+target_compile_options(${COMPONENT_LIB} PRIVATE -O3)
+
 # Enables JPEGDEC's ESP32S3_SIMD code paths (gated on this macro upstream).
 # Private: dependents only need JPEGDEC.h, which is macro-free.
 target_compile_definitions(${COMPONENT_LIB} PRIVATE ARDUINO_ARCH_ESP32)

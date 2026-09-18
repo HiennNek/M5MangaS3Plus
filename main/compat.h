@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <string>
 
+#include "cpufreq.h"
 #include "esp_random.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -34,10 +35,11 @@ inline void idf_delay(uint32_t ms) {
 }
 
 // ---- CPU frequency --------------------------------------------------------
-// Arduino setCpuFrequencyMhz() does not exist in ESP-IDF. Clock scaling is
-// handled by CONFIG_PM_ENABLE + automatic DFS, so these become no-ops that
-// keep the original call sites compiling while preserving intent in comments.
-inline void setCpuFrequencyMhz(uint32_t /*mhz*/) {}
+// Arduino setCpuFrequencyMhz() does not exist in ESP-IDF, but making it a
+// no-op left DFS parked at min_freq (40 MHz) during decodes -- see
+// cpufreq.h. It now takes/releases a real ESP_PM_CPU_FREQ_MAX lock, so the
+// original call sites do what the sketch intended.
+inline void setCpuFrequencyMhz(uint32_t mhz) { cpuSetFast(mhz >= 160); }
 
 // ---- random ---------------------------------------------------------------
 inline long idf_random(long max) {

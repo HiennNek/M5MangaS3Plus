@@ -39,6 +39,9 @@ struct PageData {
   size_t size = 0;
   bool owned = false;
 };
+// Bulk read into a caller-owned buffer. Use instead of fread() for page-
+// sized files: see the comment in storage.cpp for why stdio is slow here.
+size_t readFileToBuffer(const char *path, uint8_t *dst, size_t size);
 size_t loadFileToJpgBuffer(const char *path);
 uint8_t *jpgSharedBuffer();  // buffer behind loadFileToJpgBuffer
 PageData loadPageData(const std::string &mangaPath, int page);
