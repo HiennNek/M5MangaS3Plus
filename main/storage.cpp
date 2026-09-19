@@ -133,17 +133,22 @@ static void storeCachedPageCount(const std::string &folder, int count) {
   }
 }
 
-std::string makePagePath(const std::string &folder, int n) {
-  char buf[256];
-  snprintf(buf, sizeof(buf), "%s/%s%0*d%s", folder.c_str(), IMG_PREFIX,
-           IMG_DIGITS, n, IMG_SUFFIX);
-  return std::string(buf);
+// FAT long file names reach 255 characters, so "/sdcard/manga/<name>" can
+// exceed the 256-byte stack buffers this used to build paths in. snprintf
+// truncated silently, so page probes hit the wrong (nonexistent) path and a
+// long-named book read as empty. Build the file name separately and append.
+static std::string pageFileName(int n) {
+  char nm[32];
+  snprintf(nm, sizeof(nm), "/%s%0*d%s", IMG_PREFIX, IMG_DIGITS, n, IMG_SUFFIX);
+  return std::string(nm);
 }
 
-static bool pageExistsFast(char *buf, int prefixLen, int n) {
-  snprintf(buf + prefixLen, 256 - (size_t)prefixLen, "/%s%0*d%s", IMG_PREFIX,
-           IMG_DIGITS, n, IMG_SUFFIX);
-  return access(buf, F_OK) == 0;
+std::string makePagePath(const std::string &folder, int n) {
+  return folder + pageFileName(n);
+}
+
+static bool pageExistsFast(const std::string &folder, int n) {
+  return access((folder + pageFileName(n)).c_str(), F_OK) == 0;
 }
 
 bool pageExists(const std::string &folder, int n) {
@@ -340,12 +345,7 @@ int findTotalPages(const std::string &folder) {
     return count;
   }
 
-  char pathBuf[256];
-  strncpy(pathBuf, folder.c_str(), sizeof(pathBuf) - 64);
-  pathBuf[sizeof(pathBuf) - 65] = '\0';
-  int prefixLen = strlen(pathBuf);
-
-  if (!pageExistsFast(pathBuf, prefixLen, 0)) {
+  if (!pageExistsFast(folder, 0)) {
     cachedFolder = folder;
     cachedCount = 0;
     storeCachedPageCount(folder, 0);
@@ -353,7 +353,7 @@ int findTotalPages(const std::string &folder) {
   }
 
   int hi = 1;
-  while (pageExistsFast(pathBuf, prefixLen, hi)) {
+  while (pageExistsFast(folder, hi)) {
     hi *= 2;
     if (hi > 100000) {
       hi = 100000;
@@ -364,7 +364,7 @@ int findTotalPages(const std::string &folder) {
   int lo = hi / 2;
   while (lo + 1 < hi) {
     int mid = lo + (hi - lo) / 2;
-    if (pageExistsFast(pathBuf, prefixLen, mid))
+    if (pageExistsFast(folder, mid))
       lo = mid;
     else
       hi = mid;
@@ -376,20 +376,42 @@ int findTotalPages(const std::string &folder) {
   return cachedCount;
 }
 
-void saveProgress() {
+// Progress is throttled to spare NVS flash wear while paging quickly, but a
+// throttled call used to be dropped for good: the RAM copy advanced while the
+// persisted copy stayed behind, so the last few page turns before a
+// power-off or reset were lost. A skipped write is now remembered as pending
+// and flushed by the next call that lands outside the window, or explicitly
+// via saveProgress(true) / flushProgress().
+static bool s_progressDirty = false;
+
+static void writeProgressToNvs() {
+  nvs_handle_t h;
+  if (nvs_open("manga", NVS_READWRITE, &h) != ESP_OK) return;
+  bool ok = nvs_set_str(h, "lastPath", lastMangaPath.c_str()) == ESP_OK &&
+            nvs_set_i32(h, "lastPage", (int32_t)lastPage) == ESP_OK &&
+            nvs_commit(h) == ESP_OK;
+  nvs_close(h);
+  if (ok) s_progressDirty = false;
+}
+
+void saveProgress(bool force) {
   static uint32_t lastSaveMs = 0;
+  static bool everSaved = false;
   uint32_t now = idf_millis();
   lastMangaPath = currentMangaPath;
   lastPage = currentPage;
   updateLastMangaName();
-  if (now - lastSaveMs < 2000) return;
+  s_progressDirty = true;
+  // Unsigned subtraction is wrap-safe. everSaved keeps the very first write
+  // from being throttled against a lastSaveMs of 0 (millis() < 2 s after boot).
+  if (!force && everSaved && now - lastSaveMs < 2000) return;
   lastSaveMs = now;
-  nvs_handle_t h;
-  if (nvs_open("manga", NVS_READWRITE, &h) != ESP_OK) return;
-  nvs_set_str(h, "lastPath", currentMangaPath.c_str());
-  nvs_set_i32(h, "lastPage", (int32_t)currentPage);
-  nvs_commit(h);
-  nvs_close(h);
+  everSaved = true;
+  writeProgressToNvs();
+}
+
+void flushProgress() {
+  if (s_progressDirty) writeProgressToNvs();
 }
 
 void loadProgress() {

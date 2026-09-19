@@ -826,6 +826,7 @@ void fullRefresh() {
 }
 
 void systemShutdown() {
+  flushProgress();  // powerOff() below never returns; persist a throttled save
   setCpuFrequencyMhz(240);
   M5.Display.setEpdMode(epd_mode_t::epd_quality);
   std::vector<std::string> pics;

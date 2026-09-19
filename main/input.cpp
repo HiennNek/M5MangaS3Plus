@@ -635,6 +635,7 @@ void handleBookConfigTouch(const m5::touch_detail_t &t) {
     bookConfigOpen = false;
     currentPage = bookConfigPendingPage;
     requestRedraw(epd_mode_t::epd_quality);
+    saveProgress(true);  // a << / >> / chapter jump was never persisted
     return;
   }
 
@@ -717,7 +718,7 @@ void handleBookConfigTouch(const m5::touch_detail_t &t) {
     std::string folder = (lastSlash == std::string::npos)
                              ? currentMangaPath
                              : currentMangaPath.substr(lastSlash + 1);
-    addBookmark(folder, currentPage);
+    addBookmark(folder, bookConfigPendingPage);  // the page shown in the modal
     needRedraw = true;
     return;
   }
@@ -740,6 +741,7 @@ void handleBookConfigTouch(const m5::touch_detail_t &t) {
 
     appState = STATE_MENU;
     bookConfigOpen = false;
+    flushProgress();  // don't lose a throttled position when leaving the book
     requestRedraw();
     return;
   }

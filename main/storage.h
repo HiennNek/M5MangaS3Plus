@@ -47,6 +47,11 @@ uint8_t *jpgSharedBuffer();  // buffer behind loadFileToJpgBuffer
 PageData loadPageData(const std::string &mangaPath, int page);
 void freePageData(PageData &p);
 
-void saveProgress();
+// Records the reading position. Persisting to NVS is throttled unless
+// force is set; a throttled call leaves the position pending (see
+// flushProgress) instead of discarding it.
+void saveProgress(bool force = false);
+// Persist any position a throttled saveProgress() left pending.
+void flushProgress();
 void loadProgress();
 void updateLastMangaName();

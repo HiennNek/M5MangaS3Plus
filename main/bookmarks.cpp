@@ -20,11 +20,17 @@ void loadBookmarks() {
     std::string s = line;
     str_trim(s);
     if (s.empty()) continue;
-    size_t comma = s.find(',');
+    // Split on the LAST comma: the page is a bare integer, so the last comma
+    // is always the separator, while the title may itself contain commas
+    // ("Berserk, Vol 1.cbz"). Splitting on the first one truncated such
+    // titles and turned the rest of the name into page 0. Files written by
+    // older builds (no commas in names) parse exactly as before.
+    size_t comma = s.rfind(',');
     if (comma != std::string::npos && comma > 0) {
       Bookmark b;
       b.folder = s.substr(0, comma);
       b.page = atoi(s.c_str() + comma + 1);
+      if (b.page < 0) b.page = 0;
       bookmarks.push_back(b);
     }
   }

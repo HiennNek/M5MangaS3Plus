@@ -244,6 +244,25 @@ static const char INDEX_HTML[] = R"rawliteral(
 )rawliteral";
 
 // ---- path helpers: web "/" maps to SD mount "/sdcard" --------------------
+// The server is unauthenticated on an open AP and can delete/rename/overwrite,
+// so a web path must never resolve outside the SD mount. web_to_fs() used to
+// glue the request path onto "/sdcard" verbatim, letting "/../" climb out of
+// it. Only a ".." *segment* is dangerous ("Vol..1.cbz" is a legal name), and
+// an embedded NUL would silently truncate the path at the C-string boundary
+// (url_decode turns "%00" into one).
+static bool web_path_is_safe(const std::string &p) {
+  if (p.find('\0') != std::string::npos) return false;
+  size_t pos = 0;
+  while (pos <= p.size()) {
+    size_t slash = p.find('/', pos);
+    size_t end = (slash == std::string::npos) ? p.size() : slash;
+    if (end - pos == 2 && p[pos] == '.' && p[pos + 1] == '.') return false;
+    if (slash == std::string::npos) break;
+    pos = slash + 1;
+  }
+  return true;
+}
+
 static std::string web_to_fs(const std::string &web_path) {
   if (web_path.empty() || web_path == "/") return "/sdcard";
   if (!web_path.empty() && web_path[0] == '/')
@@ -363,6 +382,10 @@ static esp_err_t handle_list(httpd_req_t *req) {
   std::string dir = "/";
   get_query_param(req, "dir", dir);
   if (dir.empty()) dir = "/";
+  if (!web_path_is_safe(dir)) {
+    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Bad path");
+    return ESP_OK;
+  }
   std::string fs = web_to_fs(dir);
 
   DIR *d = opendir(fs.c_str());
@@ -439,6 +462,12 @@ static esp_err_t handle_delete(httpd_req_t *req) {
     size_t q2 = inner.find('"', q1 + 1);
     if (q2 == std::string::npos) break;
     std::string web = inner.substr(q1 + 1, q2 - q1 - 1);
+    pos = q2 + 1;
+    // Refuse traversal, and refuse to empty the whole card via "/" or "".
+    if (!web_path_is_safe(web) || web.empty() || web == "/") {
+      ESP_LOGW(TAG, "Refusing delete of unsafe path: %s", web.c_str());
+      continue;
+    }
     ESP_LOGI(TAG, "Deleting: %s", web.c_str());
     std::string fs = web_to_fs(web);
     rm_rf(fs);
@@ -448,7 +477,6 @@ static esp_err_t handle_delete(httpd_req_t *req) {
       if (!rest.empty() && rest.find('/') == std::string::npos)
         thumb_purge_for(rest);
     }
-    pos = q2 + 1;
   }
   heap_caps_free(raw);
   return httpd_resp_send(req, "OK", 2);
@@ -461,6 +489,10 @@ static esp_err_t handle_rename(httpd_req_t *req) {
       newp.empty()) {
     httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
                         "Rename failed");
+    return ESP_OK;
+  }
+  if (!web_path_is_safe(oldp) || !web_path_is_safe(newp)) {
+    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Bad path");
     return ESP_OK;
   }
   std::string fs_old = web_to_fs(oldp);
@@ -541,6 +573,10 @@ static esp_err_t handle_upload(httpd_req_t *req) {
       // by UI (it already passes fullPath as filename).
       std::string web = filename;
       if (web.empty() || web[0] != '/') web = "/" + web;
+      if (!web_path_is_safe(web)) {
+        ESP_LOGW(TAG, "Refusing upload to unsafe path: %s", web.c_str());
+        break;
+      }
       out_fs = web_to_fs(web);
       size_t slash = out_fs.rfind('/');
       if (slash != std::string::npos) mkdir_p(out_fs.substr(0, slash));
