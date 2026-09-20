@@ -323,6 +323,25 @@ int chapterIndexForPage(const std::string &mangaPath, int page) {
   return (idx < 0) ? 0 : idx;
 }
 
+// See header: runs on the main task from openMangaPath(). The worker's own
+// archive handle (s_preCbz in ui.cpp) is dropped separately via a cleanup
+// request, since closing it here could race an in-flight worker extract.
+void dropCachedBookData() {
+  cbz_close(s_cbz);
+  s_cbz = nullptr;
+  s_cbz_path = "";
+  s_chapters.names.clear();
+  s_chapters.starts.clear();
+  s_chapters.names.shrink_to_fit();
+  s_chapters.starts.shrink_to_fit();
+  s_chap_path = "";
+  if (jpgBuffer) {
+    heap_caps_free(jpgBuffer);
+    jpgBuffer = nullptr;
+    jpgBufferSize = 0;
+  }
+}
+
 int findTotalPages(const std::string &folder) {
   static std::string cachedFolder = "";
   static int cachedCount = 0;

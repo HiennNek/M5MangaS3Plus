@@ -46,6 +46,11 @@ size_t loadFileToJpgBuffer(const char *path);
 uint8_t *jpgSharedBuffer();  // buffer behind loadFileToJpgBuffer
 PageData loadPageData(const std::string &mangaPath, int page);
 void freePageData(PageData &p);
+// Drop all per-book cached PSRAM: the open archive's central directory,
+// the chapter list, and the shared folder-page buffer (which otherwise
+// only ever grows). Called on book switch so the next book starts from a
+// clean heap instead of inheriting fragmentation.
+void dropCachedBookData();
 
 // Records the reading position. Persisting to NVS is throttled unless
 // force is set; a throttled call leaves the position pending (see

@@ -30,6 +30,7 @@ idf_component_register(
         m5unified
         m5gfx
         jpegdec
+        stbimage
         esp_rom
         nvs_flash
         esp_wifi

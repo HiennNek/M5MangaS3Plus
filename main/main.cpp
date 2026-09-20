@@ -26,6 +26,12 @@ void openMangaPath(const std::string &path, int page) {
   currentMangaPath = path;
   currentPage = page;
 
+  // Start from a clean PSRAM heap: drop the previous book's archive,
+  // shared jpg buffer, preload state and scratch sprites, so a large
+  // book revisited later still finds a contiguous stb frame.
+  dropCachedBookData();
+  resetReaderForBookSwitch(path);
+
   M5.Display.fillScreen(TFT_WHITE);
   M5.Display.setFont(&fonts::DejaVu18);
   M5.Display.setTextColor(TFT_BLACK, TFT_WHITE);

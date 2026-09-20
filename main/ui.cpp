@@ -4,6 +4,7 @@
 #include <sys/stat.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 
@@ -28,10 +29,21 @@ static const char *TAG = "ui";
 // decoding on ESP32-S3. PNG stays on M5GFX's built-in decoder.
 #include <JPEGDEC.h>
 
+// Software fallback for oversized pages (components/stbimage): stb_image
+// decodes the full frame to grayscale in PSRAM so ui.cpp can scale it to
+// fit. JPEGDEC's power-of-two DCT scaling and M5GFX's affine scaler cannot
+// reliably handle arbitrary larger-than-screen sizes (e.g. 667x1200 on a
+// 540x960 panel) and fault with a LoadStoreError.
+#include "stb_image.h"
+
 // One decoder per task: JPEGDEC keeps decode state in the object, and the
 // main task (page render) and the preload worker can decode concurrently.
 static JPEGDEC s_jpegMain;
 static JPEGDEC s_jpegWorker;
+
+// Full-screen zoom scratch (PAGE_DEPTH, ~0.5MB). File scope so book-switch
+// cleanup can free it; drawZoomed() re-creates it on demand.
+static LGFX_Sprite s_zoomSprite(&M5.Display);
 
 // Image decoding: JPEG via JPEGDEC straight into the target sprite (format
 // is sniffed from magic bytes so CBZ entries work regardless of their file
@@ -124,6 +136,348 @@ static void applyPixelLut(LGFX_Sprite &spr, const PixelLut &lut) {
   for (size_t i = 0; i < n; i++) buf[i] = lut.map[buf[i]];
 }
 
+// ---- Oversized-image handling -------------------------------------------
+// Fast paths below (JPEGDEC / M5GFX) clip rather than scale: any source
+// larger than the target sprite in either dimension would be top-left
+// cropped, and worse, their scalers fault on such inputs (LoadStoreError
+// for a 667x1200 JPEG on the 540x960 panel). Images that do not fit are
+// therefore routed through stb_image, which decodes the full frame to
+// grayscale in PSRAM and scales it to fit with aspect preservation.
+//
+// Header parsing is decoder-free on purpose: it only reads the SOF/IHDR
+// markers, so merely probing a large image can never crash.
+
+// JPEG SOF0-SOF3 (baseline/extended/progressive) carry the size. Other SOF
+// markers (except DHT/JPG/DAC) are accepted the same way.
+static bool jpegDimensions(const uint8_t *buf, size_t size, int *w, int *h) {
+  if (size < 4 || buf[0] != 0xFF || buf[1] != 0xD8) return false;
+  size_t pos = 2;
+  while (pos + 4 <= size) {
+    if (buf[pos] != 0xFF) return false;
+    // Skip fill bytes (0xFF padding before the marker).
+    while (pos + 1 < size && buf[pos + 1] == 0xFF) pos++;
+    if (pos + 4 > size) return false;
+    uint8_t marker = buf[pos + 1];
+    // Standalone markers carry no length.
+    if (marker == 0xD8 || marker == 0xD9 || marker == 0x01 ||
+        (marker >= 0xD0 && marker <= 0xD7)) {
+      pos += 2;
+      continue;
+    }
+    uint16_t len =
+        (uint16_t)((buf[pos + 2] << 8) | buf[pos + 3]);
+    if (len < 2 || pos + 2 + len > size) return false;
+    const bool isSof =
+        (marker >= 0xC0 && marker <= 0xCF && marker != 0xC4 &&
+         marker != 0xC8 && marker != 0xCC);
+    if (isSof) {
+      if (len < 7) return false;
+      *h = (buf[pos + 5] << 8) | buf[pos + 6];
+      *w = (buf[pos + 7] << 8) | buf[pos + 8];
+      return *w > 0 && *h > 0;
+    }
+    if (marker == 0xDA) return false;  // SOS before SOF: not a plain image
+    pos += 2 + len;
+  }
+  return false;
+}
+
+static bool pngDimensions(const uint8_t *buf, size_t size, int *w, int *h) {
+  if (size < 24 || !isPng(buf, size)) return false;
+  // 8-byte signature + 4-byte length + "IHDR" + W/H big-endian.
+  if (buf[12] != 'I' || buf[13] != 'H' || buf[14] != 'D' ||
+      buf[15] != 'R')
+    return false;
+  *w = (buf[16] << 24) | (buf[17] << 16) | (buf[18] << 8) | buf[19];
+  *h = (buf[20] << 24) | (buf[21] << 16) | (buf[22] << 8) | buf[23];
+  return *w > 0 && *h > 0;
+}
+
+static bool imageDimensions(const uint8_t *buf, size_t size, int *w,
+                            int *h) {
+  if (isJpeg(buf, size)) return jpegDimensions(buf, size, w, h);
+  if (isPng(buf, size)) return pngDimensions(buf, size, w, h);
+  return false;
+}
+
+// Progressive JPEG (SOF2) never takes the fast path: JPEGDEC only decodes
+// its DC scan (a 1/8-size draft), so even a small progressive page would
+// show as a tiny top-left stamp. stb_image decodes them fully.
+static bool isProgressiveJpeg(const uint8_t *buf, size_t size) {
+  if (!isJpeg(buf, size) || size < 4) return false;
+  size_t pos = 2;
+  while (pos + 4 <= size) {
+    if (buf[pos] != 0xFF) return false;
+    while (pos + 1 < size && buf[pos + 1] == 0xFF) pos++;
+    if (pos + 4 > size) return false;
+    uint8_t marker = buf[pos + 1];
+    if (marker == 0xD8 || marker == 0xD9 || marker == 0x01 ||
+        (marker >= 0xD0 && marker <= 0xD7)) {
+      pos += 2;
+      continue;
+    }
+    uint16_t len = (uint16_t)((buf[pos + 2] << 8) | buf[pos + 3]);
+    if (len < 2 || pos + 2 + len > size) return false;
+    if (marker == 0xC2) return true;   // SOF2: progressive
+    if ((marker >= 0xC0 && marker <= 0xCF && marker != 0xC4 &&
+         marker != 0xC8 && marker != 0xCC))
+      return false;  // baseline/extended SOF: not progressive
+    if (marker == 0xDA) return false;  // SOS before SOF
+    pos += 2 + len;
+  }
+  return false;
+}
+
+// True when the source cannot be shown 1:1 in the target box and must go
+// through the fit-to-screen path instead of the clipping fast paths.
+// Unknown dimensions for a known JPEG/PNG also take the safe path: stb_image
+// fails gracefully while the fast scalers can fault.
+static bool needsFitToScreen(const uint8_t *buf, size_t size, int maxWidth,
+                             int maxHeight) {
+  if (maxWidth <= 0 || maxHeight <= 0) return false;
+  if (isProgressiveJpeg(buf, size)) return true;
+  int w = 0, h = 0;
+  if (!imageDimensions(buf, size, &w, &h))
+    return isJpeg(buf, size) || isPng(buf, size);
+  return w > maxWidth || h > maxHeight;
+}
+
+// Confirmed oversized for the display (dimensions known and exceeding it).
+// Unlike needsFitToScreen() this is false for small progressive/unknown
+// images, so it drives the memory policy below: only true oversize pays
+// for a w*h PSRAM frame worth disabling the preloader over.
+static bool isOversizedPage(const uint8_t *buf, size_t size) {
+  int w = 0, h = 0;
+  return imageDimensions(buf, size, &w, &h) &&
+         (w > DISPLAY_W || h > DISPLAY_H);
+}
+
+static inline uint8_t lumaToRgb332(uint8_t v) {
+  return (uint8_t)((((v >> 5) << 3) + (v >> 5)) << 2) + (v >> 6);
+}
+
+// Bilinear fit of an 8-bit grayscale source into an 8-bit sprite,
+// centered with white letterboxing. outW/outH preserve the source aspect
+// ratio; dstW/dstH is the sprite pitch. map converts source luma to the
+// destination encoding (panel gray for pages, rgb332 for thumbs); pass
+// nullptr for identity.
+static void blitFitGray(uint8_t *dst, int dstW, int dstH, const uint8_t *src,
+                        int srcW, int srcH, int outW, int outH,
+                        const uint8_t *map) {
+  const int ox = (dstW - outW) / 2;
+  const int oy = (dstH - outH) / 2;
+  const float xScale = (float)srcW / (float)outW;
+  const float yScale = (float)srcH / (float)outH;
+  for (int dy = 0; dy < outH; dy++) {
+    const float sy = (dy + 0.5f) * yScale - 0.5f;
+    int y0 = (int)floorf(sy);
+    float fy = sy - (float)y0;
+    if (y0 < 0) {
+      y0 = 0;
+      fy = 0.0f;
+    } else if (y0 >= srcH - 1) {
+      y0 = srcH - 1;
+      fy = 0.0f;
+    }
+    int y1 = y0 + 1;
+    if (y1 >= srcH) y1 = srcH - 1;
+    const uint8_t *row0 = src + (size_t)y0 * srcW;
+    const uint8_t *row1 = src + (size_t)y1 * srcW;
+    uint8_t *drow = dst + (size_t)(oy + dy) * dstW + ox;
+    for (int dx = 0; dx < outW; dx++) {
+      const float sx = (dx + 0.5f) * xScale - 0.5f;
+      int x0 = (int)floorf(sx);
+      float fx = sx - (float)x0;
+      if (x0 < 0) {
+        x0 = 0;
+        fx = 0.0f;
+      } else if (x0 >= srcW - 1) {
+        x0 = srcW - 1;
+        fx = 0.0f;
+      }
+      int x1 = x0 + 1;
+      if (x1 >= srcW) x1 = srcW - 1;
+      const int p00 = row0[x0], p10 = row0[x1];
+      const int p01 = row1[x0], p11 = row1[x1];
+      const float top = (float)p00 + (float)(p10 - p00) * fx;
+      const float bot = (float)p01 + (float)(p11 - p01) * fx;
+      int v = (int)(top + (bot - top) * fy + 0.5f);
+      if (v < 0)
+        v = 0;
+      else if (v > 255)
+        v = 255;
+      drow[dx] = map ? map[v] : (uint8_t)v;
+    }
+  }
+}
+
+// Large-image page path: decode via stb_image to 1-channel grayscale in
+// PSRAM, then bilinear-fit into the page sprite with the contrast/gray LUT
+// folded in. Covers JPEG (baseline + progressive) and PNG; the fast paths
+// cannot scale these reliably.
+static bool decodeLargeFitToPage(LGFX_Sprite &spr, uint8_t *buf, size_t size,
+                                 int x, int y, int maxWidth, int maxHeight,
+                                 const PixelLut *lut) {
+  if (!buf || size == 0 || size > (size_t)INT32_MAX) return false;
+  if (maxWidth <= 0 || maxHeight <= 0) return false;
+  uint8_t *dst = (uint8_t *)spr.getBuffer();
+  if (!dst) return false;
+
+  // Early space check from the header probe: the stb frame needs w*h
+  // contiguous PSRAM bytes, and on an 8MB part a huge panorama can never
+  // fit no matter what we free. Fail fast with an error message instead
+  // of churning through a doomed decode.
+  {
+    int probeW = 0, probeH = 0;
+    if (imageDimensions(buf, size, &probeW, &probeH)) {
+      if (probeW > 5000 || probeH > 5000 ||
+          (size_t)probeW * (size_t)probeH > 10u * 1024u * 1024u) {
+        ESP_LOGW(TAG, "large image %dx%d exceeds fit cap", probeW, probeH);
+        return false;
+      }
+      const size_t need = (size_t)probeW * (size_t)probeH;
+      const size_t largest =
+          heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
+      if (need > largest) {
+        ESP_LOGW(TAG, "large image %dx%d needs %u contig, largest free %u",
+                 probeW, probeH, (unsigned)need, (unsigned)largest);
+        return false;
+      }
+    }
+  }
+
+  int srcW = 0, srcH = 0;
+  // Force 1 channel: halves PSRAM vs RGB and matches the gray panel.
+  uint8_t *src = stbi_load_from_memory(buf, (int)size, &srcW, &srcH,
+                                       nullptr, 1);
+  if (!src || srcW <= 0 || srcH <= 0) {
+    if (src) stbi_image_free(src);
+    return false;
+  }
+  // Guard PSRAM: a pathological panorama must fail with an error message,
+  // never with an OOM abort deep in the decoder.
+  const size_t pxCount = (size_t)srcW * (size_t)srcH;
+  if (srcW > 5000 || srcH > 5000 || pxCount > 10u * 1024u * 1024u) {
+    ESP_LOGW(TAG, "large image %dx%d exceeds fit cap", srcW, srcH);
+    stbi_image_free(src);
+    return false;
+  }
+
+  const float fitScale =
+      std::min((float)maxWidth / (float)srcW, (float)maxHeight / (float)srcH);
+  // Never upscale: unknown-dimension small images reach this path via the
+  // conservative needsFitToScreen() probe and must stay 1:1, like the fast
+  // path would show them.
+  const float scale = fitScale > 1.0f ? 1.0f : fitScale;
+  int outW = (int)((float)srcW * scale + 0.5f);
+  int outH = (int)((float)srcH * scale + 0.5f);
+  if (outW < 1) outW = 1;
+  if (outH < 1) outH = 1;
+  if (outW > maxWidth) outW = maxWidth;
+  if (outH > maxHeight) outH = maxHeight;
+
+  spr.fillScreen(TFT_WHITE);
+  // Pages always pass (0,0,DISPLAY_W,DISPLAY_H) with a sprite of the same
+  // size, so centering in the sprite is centering in the caller's box.
+  // The x/y/maxWidth/maxHeight parameters are kept for signature parity
+  // with the fast path; assert the assumption instead of silently
+  // mis-centering if a future caller changes it.
+  const int sprW = spr.width(), sprH = spr.height();
+  (void)x;
+  (void)y;
+  if (sprW != maxWidth || sprH != maxHeight) {
+    ESP_LOGW(TAG, "large-fit box %dx%d != sprite %dx%d", maxWidth, maxHeight,
+             sprW, sprH);
+  }
+  blitFitGray(dst, sprW, sprH, src, srcW, srcH, outW, outH, lut->map);
+  ESP_LOGI(TAG, "large image %dx%d -> %dx%d fit", srcW, srcH, outW, outH);
+  stbi_image_free(src);
+  return true;
+}
+
+// Large-image thumbnail path: same decode, but the thumb sprite is rgb332
+// (see UI_DEPTH), so luma is converted to rgb332 instead of panel gray.
+// Thumbnails ignore contrast/gray settings by design.
+static bool decodeLargeFitToThumb(LGFX_Sprite &spr, uint8_t *buf,
+                                  size_t size) {
+  if (!buf || size == 0 || size > (size_t)INT32_MAX) return false;
+  uint8_t *dst = (uint8_t *)spr.getBuffer();
+  if (!dst) return false;
+  const int dstW = spr.width(), dstH = spr.height();
+
+  int srcW = 0, srcH = 0;
+  uint8_t *src = stbi_load_from_memory(buf, (int)size, &srcW, &srcH,
+                                       nullptr, 1);
+  if (!src || srcW <= 0 || srcH <= 0) {
+    if (src) stbi_image_free(src);
+    return false;
+  }
+  const size_t pxCount = (size_t)srcW * (size_t)srcH;
+  if (srcW > 5000 || srcH > 5000 || pxCount > 10u * 1024u * 1024u) {
+    stbi_image_free(src);
+    return false;
+  }
+  const float fitScaleThumb =
+      std::min((float)dstW / (float)srcW, (float)dstH / (float)srcH);
+  const float scale = fitScaleThumb > 1.0f ? 1.0f : fitScaleThumb;
+  int outW = (int)((float)srcW * scale + 0.5f);
+  int outH = (int)((float)srcH * scale + 0.5f);
+  if (outW < 1) outW = 1;
+  if (outH < 1) outH = 1;
+  if (outW > dstW) outW = dstW;
+  if (outH > dstH) outH = dstH;
+
+  spr.fillScreen(TFT_WHITE);
+  // Convert on the fly: bilinear in luma, then luma->rgb332 per pixel.
+  const int ox = (dstW - outW) / 2;
+  const int oy = (dstH - outH) / 2;
+  const float xScale = (float)srcW / (float)outW;
+  const float yScale = (float)srcH / (float)outH;
+  for (int dy = 0; dy < outH; dy++) {
+    const float sy = (dy + 0.5f) * yScale - 0.5f;
+    int y0 = (int)floorf(sy);
+    float fy = sy - (float)y0;
+    if (y0 < 0) {
+      y0 = 0;
+      fy = 0.0f;
+    } else if (y0 >= srcH - 1) {
+      y0 = srcH - 1;
+      fy = 0.0f;
+    }
+    int y1 = y0 + 1;
+    if (y1 >= srcH) y1 = srcH - 1;
+    const uint8_t *row0 = src + (size_t)y0 * srcW;
+    const uint8_t *row1 = src + (size_t)y1 * srcW;
+    uint8_t *drow = dst + (size_t)(oy + dy) * dstW + ox;
+    for (int dx = 0; dx < outW; dx++) {
+      const float sx = (dx + 0.5f) * xScale - 0.5f;
+      int x0 = (int)floorf(sx);
+      float fx = sx - (float)x0;
+      if (x0 < 0) {
+        x0 = 0;
+        fx = 0.0f;
+      } else if (x0 >= srcW - 1) {
+        x0 = srcW - 1;
+        fx = 0.0f;
+      }
+      int x1 = x0 + 1;
+      if (x1 >= srcW) x1 = srcW - 1;
+      const int p00 = row0[x0], p10 = row0[x1];
+      const int p01 = row1[x0], p11 = row1[x1];
+      const float top = (float)p00 + (float)(p10 - p00) * fx;
+      const float bot = (float)p01 + (float)(p11 - p01) * fx;
+      int v = (int)(top + (bot - top) * fy + 0.5f);
+      if (v < 0)
+        v = 0;
+      else if (v > 255)
+        v = 255;
+      drow[dx] = lumaToRgb332((uint8_t)v);
+    }
+  }
+  stbi_image_free(src);
+  return true;
+}
+
 struct JpegDrawContext {
   LGFX_Sprite *spr;
   int offsetX;
@@ -190,6 +544,17 @@ static bool decodeJpegToSprite(JPEGDEC &dec, LGFX_Sprite &spr, uint8_t *buf,
 
   const int srcW = dec.getWidth(), srcH = dec.getHeight();
 
+  // Safety net for headers the pre-probe could not parse: never run the
+  // clipping JPEGDEC path on a larger-than-target source. It crops instead
+  // of fitting and faults on such inputs, so hand off to the stb_image
+  // fit-to-screen path while the decoder handle is still clean.
+  if (maxWidth > 0 && maxHeight > 0 &&
+      (srcW > maxWidth || srcH > maxHeight)) {
+    dec.close();
+    return decodeLargeFitToPage(spr, buf, size, x, y, maxWidth, maxHeight,
+                                lut);
+  }
+
   // Pick the cheapest power-of-two scale that still covers the target.
   // The old code always ran a full-resolution decode and then had drawMCU
   // throw away everything past 540x960, so an oversized page (any CBZ that
@@ -223,12 +588,21 @@ static bool decodeJpegToSprite(JPEGDEC &dec, LGFX_Sprite &spr, uint8_t *buf,
 
 // JPEG folds contrast/gray into the MCU callback; PNG goes through M5GFX's
 // decoder (no callback to hook), so it keeps the old full-frame passes.
+// Images larger than the target box in either dimension take the stb_image
+// fit-to-screen path: the fast paths clip instead of scaling, and their
+// scalers fault on such inputs (e.g. 667x1200 on a 540x960 panel).
 static bool decodeImageToSprite(LGFX_Sprite &spr, JPEGDEC &dec, uint8_t *buf,
                                 size_t size, int x, int y, int maxWidth,
                                 int maxHeight,
                                 ContrastPreset preset = CONTRAST_NORMAL,
                                 int levels = 16) {
   if (!buf || size == 0) return false;
+  if (needsFitToScreen(buf, size, maxWidth, maxHeight)) {
+    PixelLut lut;
+    buildPixelLut(lut, preset, levels);
+    return decodeLargeFitToPage(spr, buf, size, x, y, maxWidth, maxHeight,
+                                &lut);
+  }
   if (isJpeg(buf, size)) {  // JPEG (clears only the uncovered margins)
     PixelLut lut;
     buildPixelLut(lut, preset, levels);
@@ -333,23 +707,146 @@ void clampZoomViewport() {
   zoomCY = (int)cy;
 }
 
-void drawZoomed(bool qualityMode) {
-  static LGFX_Sprite zoomSprite(&M5.Display);
-  prepareSprite(zoomSprite, DISPLAY_W, DISPLAY_H, PAGE_DEPTH, true);
-  if (!zoomSprite.getBuffer() || !gSprite.getBuffer()) return;
+// Source-resolution zoom for oversized pages. drawZoomed() magnifies gSprite,
+// which for an oversized page is already downscaled to fit — zooming it just
+// enlarges those pixels. This re-decodes the page at full resolution and
+// resamples the zoom viewport straight from the source, so the settled
+// quality pass shows true native detail. Returns false on any failure
+// (caller falls back to sprite magnification). Only oversized pages take
+// this path: 1:1 pages are already exact in gSprite, so re-decoding them
+// would only burn time and PSRAM.
+static bool renderZoomFromSource() {
+  const float z = zoomFactor;
+  if (z <= 1.0f) return false;
+  clampZoomViewport();
+  const int cx = zoomCX, cy = zoomCY;
 
-  gSprite.setPivot(zoomCX, zoomCY);
-  if (qualityMode)
-    gSprite.pushRotateZoomWithAA(&zoomSprite, DISPLAY_W / 2, DISPLAY_H / 2, 0,
-                                 zoomFactor, zoomFactor);
-  else
-    gSprite.pushRotateZoom(&zoomSprite, DISPLAY_W / 2, DISPLAY_H / 2, 0,
-                           zoomFactor, zoomFactor);
+  uint8_t *zdst = (uint8_t *)s_zoomSprite.getBuffer();
+  if (!zdst) return false;
+
+  PageData pg = loadPageData(currentMangaPath, currentPage);
+  if (!pg.buf || pg.size == 0 || pg.size > (size_t)INT32_MAX) {
+    freePageData(pg);
+    return false;
+  }
+  if (!isOversizedPage(pg.buf, pg.size)) {
+    freePageData(pg);
+    return false;
+  }
+  int srcW = 0, srcH = 0;
+  if (!imageDimensions(pg.buf, pg.size, &srcW, &srcH)) {
+    freePageData(pg);
+    return false;
+  }
+  // Page-fit transform, recomputed identically to decodeLargeFitToPage
+  // (oversized guarantees fitScale < 1, so no upscale cap applies).
+  const float s =
+      std::min((float)DISPLAY_W / (float)srcW, (float)DISPLAY_H / (float)srcH);
+  const int outW = (int)((float)srcW * s + 0.5f);
+  const int outH = (int)((float)srcH * s + 0.5f);
+  const float ox = ((float)DISPLAY_W - (float)outW) / 2.0f;
+  const float oy = ((float)DISPLAY_H - (float)outH) / 2.0f;
+
+  // The full frame needs w*h contiguous PSRAM bytes; check before paying
+  // for the decode. Worker is idle in large-book mode, so this peak
+  // matches a normal large page decode.
+  {
+    const size_t need = (size_t)srcW * (size_t)srcH;
+    if (need > heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM)) {
+      ESP_LOGW(TAG, "zoom source %dx%d needs %u contig", srcW, srcH,
+               (unsigned)need);
+      freePageData(pg);
+      return false;
+    }
+  }
+
+  int dw = 0, dh = 0;
+  uint8_t *src =
+      stbi_load_from_memory(pg.buf, (int)pg.size, &dw, &dh, nullptr, 1);
+  freePageData(pg);
+  if (!src || dw <= 0 || dh <= 0) {
+    if (src) stbi_image_free(src);
+    return false;
+  }
+  srcW = dw;
+  srcH = dh;
+
+  PixelLut lut;
+  buildPixelLut(lut, contrastPreset, grayLevels);
+  const uint8_t *map = lut.map;
+
+  // Output pixel (dx,dy) <- sprite (cx + (dx-270)/z, cy + (dy-480)/z),
+  // exactly mirroring pushRotateZoom with pivot (cx,cy) <- source
+  // ((sprX-ox)/s, (sprY-oy)/s), the inverse of the page fit. Areas
+  // mapping outside the source stay white (pre-filled).
+  s_zoomSprite.fillScreen(TFT_WHITE);
+  const float invZ = 1.0f / z;
+  const float invS = 1.0f / s;
+  const float ctrX = (float)DISPLAY_W / 2.0f;
+  const float ctrY = (float)DISPLAY_H / 2.0f;
+  for (int dy = 0; dy < DISPLAY_H; dy++) {
+    const float srcYf = ((float)cy + ((float)dy - ctrY) * invZ - oy) * invS;
+    if (srcYf < 0.0f || srcYf > (float)(srcH - 1)) continue;
+    int y0 = (int)srcYf;
+    float fy = srcYf - (float)y0;
+    if (y0 >= srcH - 1) {
+      y0 = srcH - 1;
+      fy = 0.0f;
+    }
+    const int y1 = (y0 + 1 < srcH) ? y0 + 1 : y0;
+    const uint8_t *row0 = src + (size_t)y0 * (size_t)srcW;
+    const uint8_t *row1 = src + (size_t)y1 * (size_t)srcW;
+    uint8_t *drow = zdst + (size_t)dy * (size_t)DISPLAY_W;
+    for (int dx = 0; dx < DISPLAY_W; dx++) {
+      const float srcXf = ((float)cx + ((float)dx - ctrX) * invZ - ox) * invS;
+      if (srcXf < 0.0f || srcXf > (float)(srcW - 1)) continue;
+      int x0 = (int)srcXf;
+      float fx = srcXf - (float)x0;
+      if (x0 >= srcW - 1) {
+        x0 = srcW - 1;
+        fx = 0.0f;
+      }
+      const int x1 = (x0 + 1 < srcW) ? x0 + 1 : x0;
+      const int p00 = row0[x0], p10 = row0[x1];
+      const int p01 = row1[x0], p11 = row1[x1];
+      const float top = (float)p00 + (float)(p10 - p00) * fx;
+      const float bot = (float)p01 + (float)(p11 - p01) * fx;
+      int v = (int)(top + (bot - top) * fy + 0.5f);
+      if (v < 0)
+        v = 0;
+      else if (v > 255)
+        v = 255;
+      drow[dx] = map[v];
+    }
+  }
+  ESP_LOGI(TAG, "zoom source %dx%d z=%.2f", srcW, srcH, z);
+  stbi_image_free(src);
+  return true;
+}
+
+void drawZoomed(bool qualityMode) {
+  prepareSprite(s_zoomSprite, DISPLAY_W, DISPLAY_H, PAGE_DEPTH, true);
+  if (!s_zoomSprite.getBuffer() || !gSprite.getBuffer()) return;
+
+  // Settled quality pass on an oversized page: render from the full-res
+  // source instead of magnifying the fitted sprite. Any failure (normal
+  // page, OOM, bad file) falls through to sprite magnification.
+  const bool sourced =
+      qualityMode && renderZoomFromSource();
+  if (!sourced) {
+    gSprite.setPivot(zoomCX, zoomCY);
+    if (qualityMode)
+      gSprite.pushRotateZoomWithAA(&s_zoomSprite, DISPLAY_W / 2,
+                                   DISPLAY_H / 2, 0, zoomFactor, zoomFactor);
+    else
+      gSprite.pushRotateZoom(&s_zoomSprite, DISPLAY_W / 2, DISPLAY_H / 2, 0,
+                             zoomFactor, zoomFactor);
+  }
 
   M5.Display.startWrite();
   M5.Display.setEpdMode(qualityMode ? epd_mode_t::epd_quality
                                     : epd_mode_t::epd_fastest);
-  zoomSprite.pushSprite(0, 0);
+  s_zoomSprite.pushSprite(0, 0);
   M5.Display.display();
   M5.Display.endWrite();
 }
@@ -385,6 +882,8 @@ static bool drawCoverInto(LGFX_Sprite &dst, int x, int y,
 
   // Miss: decode page 0 straight to thumbnail scale (M5GFX picks a small
   // JPEGDIV, so this is cheaper than a full-res decode), persist, blit.
+  // Pages larger than the display take the stb_image fit path instead:
+  // M5GFX's scaler faults on such sources, just as the page path does.
   static LGFX_Sprite thumbSprite(&M5.Display);
   prepareSprite(thumbSprite, THUMB_IMG_W, THUMB_IMG_H, UI_DEPTH, true);
   if (!thumbSprite.getBuffer()) return false;
@@ -392,7 +891,9 @@ static bool drawCoverInto(LGFX_Sprite &dst, int x, int y,
   if (!pg.buf) return false;
   thumbSprite.fillScreen(TFT_WHITE);
   bool ok;
-  if (isPng(pg.buf, pg.size))
+  if (needsFitToScreen(pg.buf, pg.size, DISPLAY_W, DISPLAY_H)) {
+    ok = decodeLargeFitToThumb(thumbSprite, pg.buf, pg.size);
+  } else if (isPng(pg.buf, pg.size))
     ok = thumbSprite.drawPng(pg.buf, (uint32_t)pg.size, 0, 0, THUMB_IMG_W,
                              THUMB_IMG_H, 0, 0, 0.0f, 0.0f, middle_center);
   else
@@ -459,7 +960,53 @@ static size_t preloadReadFile(const char *path, uint8_t **out) {
   return sz;
 }
 
+// ---- Oversized-book memory policy --------------------------------------
+// A large page needs its JPEG bytes plus a full w*h grayscale frame in
+// PSRAM at once (667x1200 ~= 0.8MB, bigger panoramas multi-MB) on top of
+// the ~1.5MB of page sprites. Decoding one concurrently on the worker
+// doubles that transient peak, and after some pages of malloc/free churn
+// the next contiguous stb allocation fails with "Cannot decode image".
+// So once the reader has shown one oversized page, preloading is disabled
+// for the rest of that book: every later page decodes on demand on the
+// main task with the worker idle. Main-task only state (preloadPage and
+// drawPage both run there), reset on book change.
+static bool s_largeBookMode = false;
+static std::string s_largeBookPath;
+
+static void resetLargeBookModeFor(const std::string &path) {
+  if (s_largeBookPath != path) {
+    s_largeBookPath = path;
+    s_largeBookMode = false;
+  }
+}
+
+// Cancel any pending/in-flight preload and reclaim the ~0.5MB menu sprite
+// (dead weight in reader mode; rebuilt on the next menu visit) before a
+// large stb decode. Never touches nextPageSprite: the worker may be
+// mid-write into it.
+static void prepareForLargeDecode() {
+  if (s_preTask && s_preMutex) {
+    xSemaphoreTake(s_preMutex, portMAX_DELAY);
+    isNextPageReady = false;
+    preloadedPage = -1;
+    s_reqSeq++;  // in-flight worker result is discarded, never published
+    xSemaphoreGive(s_preMutex);
+  } else {
+    isNextPageReady = false;
+    preloadedPage = -1;
+  }
+  if (menuCacheSprite.getBuffer()) {
+    menuCacheSprite.deleteSprite();
+    menuCacheValid = false;
+  }
+  ESP_LOGI(TAG, "large-decode PSRAM free=%u largest=%u",
+           (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+           (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
+}
+
 void preloadPage(int page) {
+  resetLargeBookModeFor(currentMangaPath);
+  if (s_largeBookMode) return;  // oversized book: decode on demand, save PSRAM
   if (!ensurePreloader()) return;  // worker unavailable: skip preloading
   if (page < 0 || page >= totalPages) return;
 
@@ -489,7 +1036,17 @@ void preloadPage(int page) {
 // worker-private buffers and its own CBZ handle; the handoff globals are
 // published under s_preMutex only if the request is still current.
 static void preloadDecode(const PreloadReq &req) {
-  if (req.page < 0) return;
+  if (req.page < 0) {
+    // Book-switch cleanup request: drop the worker archive when it no
+    // longer matches, so the old book's central directory doesn't pin
+    // PSRAM forever (no further preloads arrive in large-book mode).
+    if (s_preCbz && s_preCbzPath != req.path) {
+      cbz_close(s_preCbz);
+      s_preCbz = nullptr;
+      s_preCbzPath = "";
+    }
+    return;
+  }
 
   // The worker never went through main.cpp's setCpuFrequencyMhz() brackets,
   // so its decodes ran at the DFS minimum.
@@ -510,6 +1067,15 @@ static void preloadDecode(const PreloadReq &req) {
     if (s_preCbz) size = cbz_extract(s_preCbz, (size_t)req.page, &buf);
   } else {
     size = preloadReadFile(makePagePath(req.path, req.page).c_str(), &buf);
+  }
+
+  // Oversized target: skip the multi-MB stb frame entirely. The main task
+  // decodes it on demand with the worker idle (see policy above). Probes
+  // confirmed dimensions only, so small progressive pages still preload.
+  if (buf && size > 0 && isOversizedPage(buf, size)) {
+    ESP_LOGI(TAG, "preload %d: oversized, skip (main will decode)", req.page);
+    heap_caps_free(buf);
+    return;
   }
 
   const int64_t tDec0 = esp_timer_get_time();
@@ -1127,6 +1693,43 @@ static bool prevSlotMatches() {
          prevPageSprite.getColorDepth() == PAGE_DEPTH;
 }
 
+// Book-switch cleanup (called from openMangaPath): leave no stale per-book
+// PSRAM behind, so returning to a large book finds a clean heap for its
+// w*h stb frame. Cancels preloads, asks the worker to drop its archive
+// handle, resets large-book + prev-slot keys, and frees the zoom scratch
+// buffer. The main archive, chapter list and shared jpg buffer are dropped
+// via dropCachedBookData(); page sprites are intentionally kept (fixed
+// size, reused in place by the first drawPage).
+void resetReaderForBookSwitch(const std::string &newPath) {
+  if (s_preTask && s_preMutex) {
+    xSemaphoreTake(s_preMutex, portMAX_DELAY);
+    isNextPageReady = false;
+    preloadedPage = -1;
+    preloadedMangaPath = "";
+    // Cleanup request, not a page: the worker drops s_preCbz when stale.
+    // An in-flight decode (if any) finishes but is discarded via seq.
+    s_req.path = newPath;
+    s_req.page = -1;
+    s_req.seq = ++s_reqSeq;
+    xSemaphoreGive(s_preMutex);
+    xTaskNotifyGive(s_preTask);
+  } else {
+    isNextPageReady = false;
+    preloadedPage = -1;
+    preloadedMangaPath = "";
+  }
+  s_largeBookPath = newPath;
+  s_largeBookMode = false;
+  s_prevPath = "";
+  s_prevPage = -1;
+  s_shownPath = "";
+  s_shownPage = -1;
+  if (s_zoomSprite.getBuffer()) s_zoomSprite.deleteSprite();
+  ESP_LOGI(TAG, "book switch PSRAM free=%u largest=%u",
+           (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+           (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
+}
+
 void drawPage() {
   // Held for the whole load: setCpuFrequencyMhz(80) on the early-return
   // paths below would otherwise drop the clock mid-decode.
@@ -1191,6 +1794,13 @@ void drawPage() {
       drawError("Cannot open image.");
       return;
     }
+    resetLargeBookModeFor(currentMangaPath);
+    if (isOversizedPage(pg.buf, pg.size)) {
+      s_largeBookMode = true;
+      // Reclaim PSRAM before the w*h stb frame is allocated: drop any
+      // pending preload and the dead menu cache (see policy above).
+      prepareForLargeDecode();
+    }
     const int64_t tDec0 = esp_timer_get_time();
     bool decodeSuccess = decodeImageToSprite(gSprite, s_jpegMain, pg.buf,
                                              pg.size, 0, 0, DISPLAY_W,
@@ -1222,7 +1832,10 @@ void drawPage() {
   s_shownContrast = contrastPreset;
   s_shownGray = grayLevels;
   const int wanted = backwards ? currentPage - 1 : currentPage + 1;
-  if (wanted >= 0 && wanted < totalPages) preloadPage(wanted);
+  // Oversized books decode on demand (see policy above): kicking the worker
+  // here would only fragment PSRAM ahead of the next large stb frame.
+  if (wanted >= 0 && wanted < totalPages && !s_largeBookMode)
+    preloadPage(wanted);
 
   const int64_t tPush0 = esp_timer_get_time();
   M5.Display.startWrite();

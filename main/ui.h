@@ -31,6 +31,10 @@ void drawBookmarks();
 void drawWifiServer();
 void drawPage();
 void preloadPage(int page);
+// Book-switch cleanup: frees stale per-book PSRAM (preload state, worker
+// archive handle, large-book/prev-slot keys, zoom scratch). Called from
+// openMangaPath() alongside dropCachedBookData().
+void resetReaderForBookSwitch(const std::string &newPath);
 void drawZoomed(bool qualityMode);
 void clampZoomViewport();
 // Page sprites use PAGE_DEPTH: Panel_EPD's write depth is grayscale_8bit,
