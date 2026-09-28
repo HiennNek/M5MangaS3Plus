@@ -517,6 +517,14 @@ STBIDEF void stbi_convert_iphone_png_to_rgb(int flag_true_if_should_convert);
 // flip the image vertically, so the first pixel in the output array is the bottom left
 STBIDEF void stbi_set_flip_vertically_on_load(int flag_true_if_should_flip);
 
+// Like stbi_load_from_memory, but asks JPEG to decode at half resolution
+// (each axis) when the caller only wants 1 channel and stb can hand the
+// luma plane back directly: only the low 4x4 DCT coefficients of each
+// block are inverse transformed, like libjpeg's scaled decode. Falls back
+// to a full-size decode when the geometry doesn't allow it; callers must
+// use the returned *x/*y.
+STBIDEF stbi_uc *stbi_load_from_memory_half(stbi_uc const *buffer, int len, int *x, int *y, int *channels_in_file, int desired_channels);
+
 // as above, but only applies to images loaded on the thread that calls the function
 // this function is only available if your compiler supports thread-local variables;
 // calling it will fail to link if your compiler doesn't
@@ -688,6 +696,14 @@ typedef unsigned char validate_uint32[sizeof(stbi__uint32)==4 ? 1 : -1];
 #define STBI_REALLOC_SIZED(p,oldsz,newsz) STBI_REALLOC(p,newsz)
 #endif
 
+// Optional: allocate with a minimum alignment. Used for JPEG component
+// planes so the luma plane can be returned to the caller without a copy
+// (its base pointer must be the pointer that STBI_FREE gets). Falls back
+// to STBI_MALLOC, in which case the copy path is used.
+#ifndef STBI_MALLOC_ALIGNED
+#define STBI_MALLOC_ALIGNED(sz,align) STBI_MALLOC(sz)
+#endif
+
 // x86/x64 detection
 #if defined(__x86_64__) || defined(_M_X64)
 #define STBI__X64_TARGET
@@ -815,10 +831,11 @@ typedef struct
    stbi_uc buffer_start[128];
    int callback_already_read;
 
+   int half_scale;      // half-resolution JPEG requested (see stbi_load_from_memory_half)
+
    stbi_uc *img_buffer, *img_buffer_end;
    stbi_uc *img_buffer_original, *img_buffer_original_end;
 } stbi__context;
-
 
 static void stbi__refill_buffer(stbi__context *s);
 
@@ -828,6 +845,7 @@ static void stbi__start_mem(stbi__context *s, stbi_uc const *buffer, int len)
    s->io.read = NULL;
    s->read_from_callbacks = 0;
    s->callback_already_read = 0;
+   s->half_scale = 0;
    s->img_buffer = s->img_buffer_original = (stbi_uc *) buffer;
    s->img_buffer_end = s->img_buffer_original_end = (stbi_uc *) buffer+len;
 }
@@ -840,6 +858,7 @@ static void stbi__start_callbacks(stbi__context *s, stbi_io_callbacks *c, void *
    s->buflen = sizeof(s->buffer_start);
    s->read_from_callbacks = 1;
    s->callback_already_read = 0;
+   s->half_scale = 0;
    s->img_buffer = s->img_buffer_original = s->buffer_start;
    stbi__refill_buffer(s);
    s->img_buffer_original_end = s->img_buffer_end;
@@ -1117,6 +1136,7 @@ STBIDEF void stbi_set_flip_vertically_on_load(int flag_true_if_should_flip)
 {
    stbi__vertically_flip_on_load_global = flag_true_if_should_flip;
 }
+
 
 #ifndef STBI_THREAD_LOCAL
 #define stbi__vertically_flip_on_load  stbi__vertically_flip_on_load_global
@@ -1430,6 +1450,15 @@ STBIDEF stbi_uc *stbi_load_from_memory(stbi_uc const *buffer, int len, int *x, i
 {
    stbi__context s;
    stbi__start_mem(&s,buffer,len);
+   return stbi__load_and_postprocess_8bit(&s,x,y,comp,req_comp);
+}
+
+STBIDEF stbi_uc *stbi_load_from_memory_half(stbi_uc const *buffer, int len, int *x, int *y, int *comp, int req_comp)
+{
+   stbi__context s;
+   stbi__start_mem(&s,buffer,len);
+   if (req_comp == 1)
+      s.half_scale = 1;
    return stbi__load_and_postprocess_8bit(&s,x,y,comp,req_comp);
 }
 
@@ -1990,6 +2019,8 @@ typedef struct
    int            jfif;
    int            app14_color_transform; // Adobe APP14 tag
    int            rgb;
+   int            luma_only; // 1-channel request on YCbCr: decode Y only
+   int            half_scale; // decode at half resolution (4x4 IDCT)
 
    int scan_n, order[4];
    int restart_interval, todo;
@@ -2464,11 +2495,108 @@ stbi_inline static stbi_uc stbi__clamp(int x)
    t1 += p2+p4;                                \
    t0 += p1+p3;
 
+#define STBI__IDCT4_DESCALE(x,n)  (((x) + (1 << ((n)-1))) >> (n))
+// Half-resolution 4x4-output IDCT: a port of the reduced-size IDCT from
+// libjpeg's jidctred.c (IJG / libjpeg-turbo, same constants and rounding),
+// so the result matches libjpeg's scaled "draft" decode. Each 8x8
+// coefficient block yields a 4x4 pixel block; only 4 of the 8 outputs of
+// each 1-D pass are computed, cutting IDCT work ~2.4x. The input block is
+// already dequantized (stb multiplies during entropy decode).
+static void stbi__idct_block_half(stbi_uc *out, int out_stride, short data[64])
+{
+   int ws[4][8]; // [output row][column], pass-1 workspace
+   int col, row;
+
+   // Flat block (no AC): whole 4x4 collapses to a constant, same value the
+   // generic passes below produce. Common in the flat regions of line art.
+   {
+      int k, any = 0;
+      for (k = 1; k < 64; ++k) any |= data[k];
+      if (!any) {
+         stbi_uc p = stbi__clamp((((int)((unsigned)data[0] << 2) + 16) >> 5) + 128);
+         out[0]=p; out[1]=p; out[2]=p; out[3]=p;
+         out += out_stride;
+         out[0]=p; out[1]=p; out[2]=p; out[3]=p;
+         out += out_stride;
+         out[0]=p; out[1]=p; out[2]=p; out[3]=p;
+         out += out_stride;
+         out[0]=p; out[1]=p; out[2]=p; out[3]=p;
+         return;
+      }
+   }
+
+   // Pass 1: columns. Column 4 is not needed by pass 2.
+   for (col = 0; col < 8; ++col) {
+      if (col == 4) continue;
+      if (data[8*1+col]==0 && data[8*2+col]==0 && data[8*3+col]==0 &&
+          data[8*5+col]==0 && data[8*6+col]==0 && data[8*7+col]==0) {
+         int dcval = (int)((unsigned)data[col] << 2); // LEFT_SHIFT(x, PASS1_BITS=2)
+         ws[0][col] = ws[1][col] = ws[2][col] = ws[3][col] = dcval;
+         continue;
+      }
+      {
+         int tmp0, tmp2, tmp10, tmp12, z1, z2, z3, z4;
+         tmp0 = (int)((unsigned)data[0*8+col] << 14); // CONST_BITS(13)+1
+         z2 = data[2*8+col]; z3 = data[6*8+col];
+         tmp2 = z2*15137 + z3*(-6270);
+         tmp10 = tmp0 + tmp2;
+         tmp12 = tmp0 - tmp2;
+         z1 = data[7*8+col]; z2 = data[5*8+col];
+         z3 = data[3*8+col]; z4 = data[1*8+col];
+         tmp0 = z1*(-1730) + z2*11893 + z3*(-17799) + z4*8697;
+         tmp2 = z1*(-4176) + z2*(-4926) + z3*7373 + z4*20995;
+         ws[0][col] = STBI__IDCT4_DESCALE(tmp10 + tmp2, 12);
+         ws[3][col] = STBI__IDCT4_DESCALE(tmp10 - tmp2, 12);
+         ws[1][col] = STBI__IDCT4_DESCALE(tmp12 + tmp0, 12);
+         ws[2][col] = STBI__IDCT4_DESCALE(tmp12 - tmp0, 12);
+      }
+   }
+
+   // Pass 2: rows 0..3.
+   for (row = 0; row < 4; ++row) {
+      stbi_uc *o = out + (size_t) row * out_stride;
+      int tmp0, tmp2, tmp10, tmp12, z1, z2, z3, z4;
+      if (ws[row][1]==0 && ws[row][2]==0 && ws[row][3]==0 &&
+          ws[row][5]==0 && ws[row][6]==0 && ws[row][7]==0) {
+         stbi_uc dc = stbi__clamp(((ws[row][0] + 16) >> 5) + 128); // DESCALE(.,5)+level
+         o[0] = o[1] = o[2] = o[3] = dc;
+         continue;
+      }
+      tmp0 = (int)((unsigned)ws[row][0] << 14);
+      tmp2 = ws[row][2]*15137 + ws[row][6]*(-6270);
+      tmp10 = tmp0 + tmp2;
+      tmp12 = tmp0 - tmp2;
+      z1 = ws[row][7]; z2 = ws[row][5]; z3 = ws[row][3]; z4 = ws[row][1];
+      tmp0 = z1*(-1730) + z2*11893 + z3*(-17799) + z4*8697;
+      tmp2 = z1*(-4176) + z2*(-4926) + z3*7373 + z4*20995;
+      o[0] = stbi__clamp(STBI__IDCT4_DESCALE(tmp10 + tmp2, 19) + 128);
+      o[3] = stbi__clamp(STBI__IDCT4_DESCALE(tmp10 - tmp2, 19) + 128);
+      o[1] = stbi__clamp(STBI__IDCT4_DESCALE(tmp12 + tmp0, 19) + 128);
+      o[2] = stbi__clamp(STBI__IDCT4_DESCALE(tmp12 - tmp0, 19) + 128);
+   }
+}
+
 static void stbi__idct_block(stbi_uc *out, int out_stride, short data[64])
 {
    int i,val[64],*v=val;
    stbi_uc *o;
    short *d = data;
+
+   // flat-block shortcut: with no AC coefficients the 1D pass collapses to
+   // a constant, so fill the whole 8x8 in one go. Very common in the flat
+   // white/black regions of scanned line art.
+   {
+      int any = 0;
+      for (i = 1; i < 64; ++i) any |= data[i];
+      if (!any) {
+         stbi_uc p = stbi__clamp((data[0]*4*4096 + 65536 + (128<<17)) >> 17);
+         for (i = 0; i < 8; ++i) {
+            memset(out, p, 8);
+            out += out_stride;
+         }
+         return;
+      }
+   }
 
    // columns
    for (i=0; i < 8; ++i,++d, ++v) {
@@ -2964,7 +3092,13 @@ static int stbi__parse_entropy_coded_data(stbi__jpeg *z)
             for (i=0; i < w; ++i) {
                int ha = z->img_comp[n].ha;
                if (!stbi__jpeg_decode_block(z, data, z->huff_dc+z->img_comp[n].hd, z->huff_ac+ha, z->fast_ac[ha], n, z->dequant[z->img_comp[n].tq])) return 0;
-               z->idct_block_kernel(z->img_comp[n].data+z->img_comp[n].w2*j*8+i*8, z->img_comp[n].w2, data);
+               if (!z->luma_only || n == 0) {
+                  int hs = (z->half_scale && n == 0);
+                  int stride = hs ? (z->img_comp[n].w2 >> 1) : z->img_comp[n].w2;
+                  stbi_uc *dst = z->img_comp[n].data + (size_t)((j*8)>>hs)*stride + ((i*8)>>hs);
+                  if (hs) stbi__idct_block_half(dst, stride, data);
+                  else    z->idct_block_kernel(dst, stride, data);
+               }
                // every data block is an MCU, so countdown the restart interval
                if (--z->todo <= 0) {
                   if (z->code_bits < 24) stbi__grow_buffer_unsafe(z);
@@ -2992,7 +3126,13 @@ static int stbi__parse_entropy_coded_data(stbi__jpeg *z)
                         int y2 = (j*z->img_comp[n].v + y)*8;
                         int ha = z->img_comp[n].ha;
                         if (!stbi__jpeg_decode_block(z, data, z->huff_dc+z->img_comp[n].hd, z->huff_ac+ha, z->fast_ac[ha], n, z->dequant[z->img_comp[n].tq])) return 0;
-                        z->idct_block_kernel(z->img_comp[n].data+z->img_comp[n].w2*y2+x2, z->img_comp[n].w2, data);
+                        if (!z->luma_only || n == 0) {
+                           int hs = (z->half_scale && n == 0);
+                           int stride = hs ? (z->img_comp[n].w2 >> 1) : z->img_comp[n].w2;
+                           stbi_uc *dst = z->img_comp[n].data + (size_t)(y2>>hs)*stride + (x2>>hs);
+                           if (hs) stbi__idct_block_half(dst, stride, data);
+                           else    z->idct_block_kernel(dst, stride, data);
+                        }
                      }
                   }
                }
@@ -3085,6 +3225,7 @@ static void stbi__jpeg_finish(stbi__jpeg *z)
       for (n=0; n < z->s->img_n; ++n) {
          int w = (z->img_comp[n].x+7) >> 3;
          int h = (z->img_comp[n].y+7) >> 3;
+         if (z->luma_only && n != 0) continue;
          for (j=0; j < h; ++j) {
             for (i=0; i < w; ++i) {
                short *data = z->img_comp[n].coeff + 64 * (i + j * z->img_comp[n].coeff_w);
@@ -3293,6 +3434,16 @@ static int stbi__process_frame_header(stbi__jpeg *z, int scan)
       z->img_comp[i].tq = stbi__get8(s);  if (z->img_comp[i].tq > 3) return stbi__err("bad TQ","Corrupt JPEG");
    }
 
+   // A 3-component YCbCr image asked for as 1 channel only ever uses the Y
+   // plane. Confirm that here, where the header state is known, and drop the
+   // chroma planes below. Conservative about Adobe RGB (APP14 can legally
+   // appear after SOF): only take the path when the current markers already
+   // rule out is_rgb, so a later APP14 cannot change the answer.
+   if (z->luma_only &&
+       !(s->img_n == 3 && z->rgb != 3 &&
+         (z->jfif || (z->app14_color_transform != -1 && z->app14_color_transform != 0))))
+      z->luma_only = 0;
+
    if (scan != STBI__SCAN_load) return 1;
 
    if (!stbi__mad3sizes_valid(s->img_x, s->img_y, s->img_n, 0)) return stbi__err("too large", "Image too large to decode");
@@ -3331,14 +3482,49 @@ static int stbi__process_frame_header(stbi__jpeg *z, int scan)
       // so these muls can't overflow with 32-bit ints (which we require)
       z->img_comp[i].w2 = z->img_mcu_x * z->img_comp[i].h * 8;
       z->img_comp[i].h2 = z->img_mcu_y * z->img_comp[i].v * 8;
+      // Half scale only pays off when component 0 is the whole output at 1:1
+      // (full-resolution luma or a gray image), both axes fit the MCU grid
+      // exactly, and the direct-return below will be taken. Otherwise the
+      // resample/upsample path expects full-resolution planes: stay full size.
+      if (i == 0 && z->half_scale) {
+         if (!((z->luma_only || s->img_n == 1) && !z->progressive &&
+               z->img_h_max == z->img_comp[0].h && z->img_v_max == z->img_comp[0].v &&
+               z->img_comp[0].w2 == (int) s->img_x))
+            z->half_scale = 0;
+      }
       z->img_comp[i].coeff = 0;
       z->img_comp[i].raw_coeff = 0;
       z->img_comp[i].linebuf = NULL;
-      z->img_comp[i].raw_data = stbi__malloc_mad2(z->img_comp[i].w2, z->img_comp[i].h2, 15);
-      if (z->img_comp[i].raw_data == NULL)
-         return stbi__free_jpeg_components(z, i+1, stbi__err("outofmem", "Out of memory"));
-      // align blocks for idct using mmx/sse
-      z->img_comp[i].data = (stbi_uc*) (((size_t) z->img_comp[i].raw_data + 15) & ~15);
+      z->img_comp[i].data = NULL;
+      z->img_comp[i].raw_data = NULL;
+      if (z->luma_only && i != 0) {
+         // Baseline never touches chroma again; progressive still needs its
+         // coefficient planes for the scan passes below, but not the pixels.
+         if (!z->progressive) continue;
+      } else {
+         int pw = z->img_comp[i].w2, ph = z->img_comp[i].h2;
+         if (i == 0 && z->half_scale) { pw >>= 1; ph >>= 1; }
+         if (!stbi__mad2sizes_valid(pw, ph, 15))
+            return stbi__free_jpeg_components(z, i+1, stbi__err("outofmem", "Out of memory"));
+         z->img_comp[i].raw_data = STBI_MALLOC_ALIGNED((size_t) pw * ph + 15, 16);
+         if (z->img_comp[i].raw_data == NULL)
+            return stbi__free_jpeg_components(z, i+1, stbi__err("outofmem", "Out of memory"));
+         // align blocks for idct using mmx/sse
+         z->img_comp[i].data = (stbi_uc*) (((size_t) z->img_comp[i].raw_data + 15) & ~15);
+         // Half scale relies on data == raw_data (the direct-return path). If
+         // the allocator could not align, redo component 0 at full size.
+         if (i == 0 && z->half_scale && z->img_comp[0].data != (stbi_uc *) z->img_comp[0].raw_data) {
+            int fw = z->img_comp[0].w2, fh = z->img_comp[0].h2;
+            STBI_FREE(z->img_comp[0].raw_data);
+            if (!stbi__mad2sizes_valid(fw, fh, 15))
+               return stbi__free_jpeg_components(z, i, stbi__err("outofmem", "Out of memory"));
+            z->img_comp[0].raw_data = STBI_MALLOC_ALIGNED((size_t) fw * fh + 15, 16);
+            if (z->img_comp[0].raw_data == NULL)
+               return stbi__free_jpeg_components(z, i, stbi__err("outofmem", "Out of memory"));
+            z->img_comp[0].data = (stbi_uc*) (((size_t) z->img_comp[0].raw_data + 15) & ~15);
+            z->half_scale = 0;
+         }
+      }
       if (z->progressive) {
          // w2, h2 are multiples of 8 (see above)
          z->img_comp[i].coeff_w = z->img_comp[i].w2 / 8;
@@ -3887,6 +4073,27 @@ static stbi_uc *load_jpeg_image(stbi__jpeg *z, int *out_x, int *out_y, int *comp
    // accessing uninitialized coutput[0] later
    if (decode_n <= 0) { stbi__cleanup_jpeg(z); return NULL; }
 
+   // When the sole output channel is component 0 at full resolution and its
+   // plane stride already matches the image width, that plane is the final
+   // image: return it as-is instead of allocating a second full-size buffer
+   // and copying every row into it. The pointer must be the one the
+   // allocator handed out (data == raw_data) for stbi_image_free to accept.
+   if (n == 1 && decode_n == 1 &&
+       z->img_comp[0].data != NULL &&
+       z->img_comp[0].data == (stbi_uc *) z->img_comp[0].raw_data &&
+       (!z->half_scale
+          ? (z->img_comp[0].w2 == (int) z->s->img_x &&
+             z->img_h_max == z->img_comp[0].h && z->img_v_max == z->img_comp[0].v)
+          : 1)) {
+      stbi_uc *output = z->img_comp[0].data;
+      z->img_comp[0].raw_data = NULL;
+      stbi__cleanup_jpeg(z);
+      *out_x = z->half_scale ? (z->s->img_x >> 1) : z->s->img_x;
+      *out_y = z->half_scale ? (z->s->img_y >> 1) : z->s->img_y;
+      if (comp) *comp = z->s->img_n >= 3 ? 3 : 1;
+      return output;
+   }
+
    // resample and color-convert
    {
       int k;
@@ -4033,6 +4240,8 @@ static void *stbi__jpeg_load(stbi__context *s, int *x, int *y, int *comp, int re
    memset(j, 0, sizeof(stbi__jpeg));
    STBI_NOTUSED(ri);
    j->s = s;
+   j->luma_only = (req_comp == 1);
+   j->half_scale = s->half_scale;
    stbi__setup_jpeg(j);
    result = load_jpeg_image(j, x,y,comp,req_comp);
    STBI_FREE(j);

@@ -323,10 +323,17 @@ static bool decodeLargeFitToPage(LGFX_Sprite &spr, uint8_t *buf, size_t size,
   uint8_t *dst = (uint8_t *)spr.getBuffer();
   if (!dst) return false;
 
+  // Baseline JPEGs at least 2x the target in one axis can decode at half
+  // resolution (4x4 IDCT, see stb_image.h): the fitted output is identical,
+  // the IDCT and the PSRAM frame are ~4x smaller. Progressive JPEG and PNG
+  // have to stay full size.
+  //
   // Early space check from the header probe: the stb frame needs w*h
   // contiguous PSRAM bytes, and on an 8MB part a huge panorama can never
   // fit no matter what we free. Fail fast with an error message instead
-  // of churning through a doomed decode.
+  // of churning through a doomed decode. A half-size frame is 1/4 the
+  // bytes, so allow it when the full frame does not fit.
+  bool canHalf = false;
   {
     int probeW = 0, probeH = 0;
     if (imageDimensions(buf, size, &probeW, &probeH)) {
@@ -335,7 +342,11 @@ static bool decodeLargeFitToPage(LGFX_Sprite &spr, uint8_t *buf, size_t size,
         ESP_LOGW(TAG, "large image %dx%d exceeds fit cap", probeW, probeH);
         return false;
       }
-      const size_t need = (size_t)probeW * (size_t)probeH;
+      canHalf = isJpeg(buf, size) && !isProgressiveJpeg(buf, size) &&
+                (probeW >= 2 * maxWidth || probeH >= 2 * maxHeight);
+      const size_t need = canHalf
+          ? (size_t)(probeW / 2) * (size_t)(probeH / 2)
+          : (size_t)probeW * (size_t)probeH;
       const size_t largest =
           heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
       if (need > largest) {
@@ -348,8 +359,11 @@ static bool decodeLargeFitToPage(LGFX_Sprite &spr, uint8_t *buf, size_t size,
 
   int srcW = 0, srcH = 0;
   // Force 1 channel: halves PSRAM vs RGB and matches the gray panel.
-  uint8_t *src = stbi_load_from_memory(buf, (int)size, &srcW, &srcH,
-                                       nullptr, 1);
+  uint8_t *src = canHalf
+                     ? stbi_load_from_memory_half(buf, (int)size, &srcW, &srcH,
+                                                  nullptr, 1)
+                     : stbi_load_from_memory(buf, (int)size, &srcW, &srcH,
+                                             nullptr, 1);
   if (!src || srcW <= 0 || srcH <= 0) {
     if (src) stbi_image_free(src);
     return false;
@@ -405,9 +419,22 @@ static bool decodeLargeFitToThumb(LGFX_Sprite &spr, uint8_t *buf,
   if (!dst) return false;
   const int dstW = spr.width(), dstH = spr.height();
 
+  // Same half-resolution trick as the page path: covers need a big downscale,
+  // so a baseline JPEG at half size still over-covers the 221x313 sprite.
+  bool canHalf = false;
+  {
+    int probeW = 0, probeH = 0;
+    canHalf = imageDimensions(buf, size, &probeW, &probeH) &&
+              isJpeg(buf, size) && !isProgressiveJpeg(buf, size) &&
+              (probeW >= 2 * dstW || probeH >= 2 * dstH);
+  }
+
   int srcW = 0, srcH = 0;
-  uint8_t *src = stbi_load_from_memory(buf, (int)size, &srcW, &srcH,
-                                       nullptr, 1);
+  uint8_t *src = canHalf
+                     ? stbi_load_from_memory_half(buf, (int)size, &srcW, &srcH,
+                                                  nullptr, 1)
+                     : stbi_load_from_memory(buf, (int)size, &srcW, &srcH,
+                                             nullptr, 1);
   if (!src || srcW <= 0 || srcH <= 0) {
     if (src) stbi_image_free(src);
     return false;

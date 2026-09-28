@@ -12,6 +12,18 @@
 #define STBI_REALLOC(p, newsz) heap_caps_realloc((p), (newsz), MALLOC_CAP_SPIRAM)
 #define STBI_FREE(p) heap_caps_free(p)
 
+// 16-byte-aligned PSRAM allocation for JPEG component planes. stb_image.h
+// uses it so data == raw_data holds and the luma plane can be handed back
+// as the load result: no second full-size buffer and no byte-by-byte row
+// copy of the whole frame (a multi-MB PSRAM round trip). Falls back to a
+// plain allocation, which just keeps stb's copy path. heap_caps_free()
+// frees aligned pointers, and component planes are never realloc'd.
+static void *stbiPsramAligned(size_t size, size_t align) {
+  void *p = heap_caps_aligned_alloc(align, size, MALLOC_CAP_SPIRAM);
+  return p ? p : heap_caps_malloc(size, MALLOC_CAP_SPIRAM);
+}
+#define STBI_MALLOC_ALIGNED(sz, align) stbiPsramAligned((sz), (align))
+
 #define STBI_NO_STDIO
 #define STBI_NO_BMP
 #define STBI_NO_PSD
