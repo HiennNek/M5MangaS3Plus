@@ -14,7 +14,6 @@ struct Bookmark {
 
 extern AppState appState;
 extern std::vector<std::string> mangaFolders;
-extern std::vector<int> mangaPageCounts;
 extern int menuSelected;
 extern int menuScroll;
 extern int bookmarkScroll;
@@ -33,6 +32,10 @@ extern float zoomFactor;
 extern int zoomCX, zoomCY;  // zoom viewport center, in page pixels
 extern std::string selectedBookmarkFolder;
 extern epd_mode_t currentEpdMode;
+// Set when the next reader repaint should run the one-shot stock (long,
+// clean) waveform instead of the fast Kindle table: opening a book and
+// closing the Book Menu. drawPage() consumes and clears it.
+extern bool forceStockRefresh;
 
 // Current / preloaded / previous page each live in an identical sprite.
 // Pages move between roles by exchanging pointers, never by copying. The

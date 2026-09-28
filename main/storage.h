@@ -17,6 +17,10 @@ bool pageExists(const std::string &folder, int n);
 // A manga entry is either a folder of m5_NNNN.jpg files or a .cbz archive.
 bool isCbzPath(const std::string &mangaPath);
 
+// True when the absolute book path is still present: a readable .cbz file,
+// or a folder holding at least page 0. Used to validate auto-resume.
+bool mangaPathExists(const std::string &mangaPath);
+
 // Chapters: shared CbzChapters model, cached per book. Empty for folder
 // manga and single-section archives (navigator hidden in that case).
 using ChapterList = CbzChapters;

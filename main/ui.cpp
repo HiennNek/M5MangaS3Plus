@@ -15,6 +15,7 @@
 #include "esp_log.h"
 #include "esp_random.h"
 #include "icon.h"
+#include "index.h"
 #include "state.h"
 #include "storage.h"
 #include "thumb.h"
@@ -1088,7 +1089,7 @@ static void preloadDecode(const PreloadReq &req) {
   if (isCbzPath(req.path)) {
     if (!s_preCbz || s_preCbzPath != req.path) {
       cbz_close(s_preCbz);
-      s_preCbz = cbz_open(req.path);
+      s_preCbz = openCbzWithIndex(req.path);
       s_preCbzPath = s_preCbz ? req.path : std::string();
     }
     if (s_preCbz) size = cbz_extract(s_preCbz, (size_t)req.page, &buf);
@@ -1757,6 +1758,31 @@ void resetReaderForBookSwitch(const std::string &newPath) {
            (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
 }
 
+// One-shot clean repaint through the panel's stock long waveform, then
+// restore the fast Kindle table so subsequent page turns stay quick.
+// Used on book open and when leaving the Book Menu. Falls back to a normal
+// fast push if the panel is not the PaperS3 EPD (host/tests).
+static void pushReaderPageStock() {
+  bool stock = false;
+  if (M5.Display.getBoard() == lgfx::board_M5PaperS3) {
+    auto *panel = static_cast<lgfx::Panel_EPD *>(M5.Display.getPanel());
+    if (panel) {
+      M5.Display.setEpdMode(epd_mode_t::epd_quality);
+      panel->refreshStockWaveform();
+      stock = true;
+    }
+  }
+  M5.Display.startWrite();
+  gSprite.pushSprite(0, 0);
+  M5.Display.display();
+  M5.Display.endWrite();
+  if (stock) {
+    M5.Display.waitDisplay();
+    auto *panel = static_cast<lgfx::Panel_EPD *>(M5.Display.getPanel());
+    if (panel) panel->restoreFastWaveform();
+  }
+}
+
 void drawPage() {
   // Held for the whole load: setCpuFrequencyMhz(80) on the early-return
   // paths below would otherwise drop the clock mid-decode.
@@ -1865,10 +1891,18 @@ void drawPage() {
     preloadPage(wanted);
 
   const int64_t tPush0 = esp_timer_get_time();
-  M5.Display.startWrite();
-  gSprite.pushSprite(0, 0);
-  M5.Display.display();
-  M5.Display.endWrite();
+  if (forceStockRefresh) {
+    // Opening a book / leaving the Book Menu: one clean long-waveform
+    // repaint, then fast turns resume.
+    forceStockRefresh = false;
+    M5.Display.setEpdMode(epd_mode_t::epd_quality);
+    pushReaderPageStock();
+  } else {
+    M5.Display.startWrite();
+    gSprite.pushSprite(0, 0);
+    M5.Display.display();
+    M5.Display.endWrite();
+  }
   ESP_LOGI(TAG, "page %d: panel %d ms", currentPage,
            (int)((esp_timer_get_time() - tPush0) / 1000));
 

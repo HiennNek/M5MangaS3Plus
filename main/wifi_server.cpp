@@ -17,6 +17,8 @@
 #include "esp_log.h"
 #include "esp_netif.h"
 #include "esp_wifi.h"
+#include "index.h"
+#include "storage.h"
 #include "thumb.h"
 
 static const char *TAG = "wifi";
@@ -471,11 +473,13 @@ static esp_err_t handle_delete(httpd_req_t *req) {
     ESP_LOGI(TAG, "Deleting: %s", web.c_str());
     std::string fs = web_to_fs(web);
     rm_rf(fs);
-    // A removed top-level /manga/<entry> orphans its cached cover.
+    // A removed top-level /manga/<entry> orphans its cached cover/index.
     if (web.size() > 7 && web.compare(0, 7, "/manga/") == 0) {
       std::string rest = web.substr(7);
-      if (!rest.empty() && rest.find('/') == std::string::npos)
+      if (!rest.empty() && rest.find('/') == std::string::npos) {
         thumb_purge_for(rest);
+        index_purge_for(rest);
+      }
     }
   }
   heap_caps_free(raw);
@@ -500,8 +504,15 @@ static esp_err_t handle_rename(httpd_req_t *req) {
   // Ensure destination parent exists.
   size_t slash = fs_new.rfind('/');
   if (slash != std::string::npos) mkdir_p(fs_new.substr(0, slash));
-  if (rename(fs_old.c_str(), fs_new.c_str()) == 0)
+  if (rename(fs_old.c_str(), fs_new.c_str()) == 0) {
+    // Old entry name's index is orphaned by the rename.
+    if (oldp.size() > 7 && oldp.compare(0, 7, "/manga/") == 0) {
+      std::string rest = oldp.substr(7);
+      if (!rest.empty() && rest.find('/') == std::string::npos)
+        index_purge_for(rest);
+    }
     return httpd_resp_send(req, "OK", 2);
+  }
   httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Rename failed");
   return ESP_OK;
 }

@@ -290,6 +290,9 @@ void handleWifiTouch(const m5::touch_detail_t &t) {
     idf_delay(50);
 
     stopWifiServer();
+    // Uploads/deletes may have changed the library: rebuild it (and the
+    // per-book page counts) so the menu reflects reality immediately.
+    scanMangaFolders();
     appState = STATE_MENU;
     menuCacheValid = false;
     requestRedraw();
@@ -634,6 +637,8 @@ void handleBookConfigTouch(const m5::touch_detail_t &t) {
   if (tapX < modX || tapX > modX + modW || tapY < modY || tapY > modY + modH) {
     bookConfigOpen = false;
     currentPage = bookConfigPendingPage;
+    // Leaving the Book Menu: repaint through the clean stock waveform.
+    forceStockRefresh = true;
     requestRedraw(epd_mode_t::epd_quality);
     saveProgress(true);  // a << / >> / chapter jump was never persisted
     return;

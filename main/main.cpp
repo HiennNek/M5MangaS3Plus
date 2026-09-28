@@ -60,6 +60,8 @@ void openMangaPath(const std::string &path, int page) {
   setCpuFrequencyMhz(80);
 
   currentEpdMode = epd_mode_t::epd_quality;
+  // First repaint of the book runs the clean stock waveform (see drawPage).
+  forceStockRefresh = true;
   appState = STATE_READER;
   needRedraw = true;
 }
@@ -94,6 +96,13 @@ extern "C" void app_main(void) {
   scanMangaFolders();
   loadProgress();
   loadBookmarks();
+
+  // Resume the last book automatically when it is still on the card.
+  // openMangaPath bails to the library (STATE_MENU stays put) if the book
+  // turned out empty, so a stale/corrupt entry cannot trap the reader.
+  if (!lastMangaPath.empty() && mangaPathExists(lastMangaPath)) {
+    openMangaPath(lastMangaPath, lastPage);
+  }
 
   needRedraw = true;
   lastInteractionMs = idf_millis();

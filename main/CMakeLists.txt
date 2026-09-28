@@ -24,6 +24,7 @@ idf_component_register(
         "wifi_server.cpp"
         "cbz.cpp"
         "thumb.cpp"
+        "index.cpp"
     INCLUDE_DIRS
         "."
     PRIV_REQUIRES

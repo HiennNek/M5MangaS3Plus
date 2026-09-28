@@ -11,6 +11,7 @@
 
 #include "compat.h"
 #include "cbz.h"
+#include "index.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_vfs_fat.h"
@@ -21,6 +22,11 @@
 
 static const char *TAG = "storage";
 static sdmmc_card_t *s_card = nullptr;
+
+// Session cache for findTotalPages(); also cleared by scanMangaFolders()
+// so a rescan after WiFi uploads/deletes never serves a stale count.
+static std::string s_totalPagesFolder;
+static int s_totalPagesCount = 0;
 
 void sdInit() {
   ESP_LOGI(TAG, "Initializing SD card over SPI");
@@ -74,7 +80,10 @@ void sdInit() {
 void scanMangaFolders() {
   setCpuFrequencyMhz(240);
   mangaFolders.clear();
-  mangaPageCounts.clear();
+  // Rebuild the library: invalidate the findTotalPages() session cache too,
+  // or a book whose files changed over WiFi could keep its old count.
+  s_totalPagesFolder.clear();
+  s_totalPagesCount = 0;
 
   DIR *dir = opendir(MANGA_ROOT);
   if (!dir) {
@@ -104,33 +113,13 @@ void scanMangaFolders() {
   closedir(dir);
 
   std::sort(mangaFolders.begin(), mangaFolders.end());
-  mangaPageCounts.assign(mangaFolders.size(), -1);
   ESP_LOGI(TAG, "Found %d manga folders", (int)mangaFolders.size());
   setCpuFrequencyMhz(80);
 }
 
-static int findCachedPageCount(const std::string &folder) {
-  size_t slash = folder.rfind('/');
-  std::string name =
-      (slash != std::string::npos) ? folder.substr(slash + 1) : folder;
-  for (size_t i = 0; i < mangaFolders.size(); ++i) {
-    if (mangaFolders[i] == name) {
-      return mangaPageCounts[i];
-    }
-  }
-  return -1;
-}
-
-static void storeCachedPageCount(const std::string &folder, int count) {
-  size_t slash = folder.rfind('/');
-  std::string name =
-      (slash != std::string::npos) ? folder.substr(slash + 1) : folder;
-  for (size_t i = 0; i < mangaFolders.size(); ++i) {
-    if (mangaFolders[i] == name) {
-      mangaPageCounts[i] = count;
-      return;
-    }
-  }
+static std::string entryName(const std::string &path) {
+  size_t slash = path.rfind('/');
+  return (slash != std::string::npos) ? path.substr(slash + 1) : path;
 }
 
 // FAT long file names reach 255 characters, so "/sdcard/manga/<name>" can
@@ -151,12 +140,30 @@ static bool pageExistsFast(const std::string &folder, int n) {
   return access((folder + pageFileName(n)).c_str(), F_OK) == 0;
 }
 
+// A cached folder page count is only trusted if the boundary still holds:
+// the last page exists and the one after it does not. This catches files
+// appended or removed even on cards whose FAT driver leaves the directory
+// mtime untouched (index_load already checked the directory mtime). The
+// m5_NNNN.jpg pattern must be gap-free, which the original binary search
+// also assumed.
+static bool indexedFolderCountValid(const std::string &folder, int count) {
+  if (count <= 0) return !pageExistsFast(folder, 0);
+  return pageExistsFast(folder, count - 1) && !pageExistsFast(folder, count);
+}
+
 bool pageExists(const std::string &folder, int n) {
   return access(makePagePath(folder, n).c_str(), F_OK) == 0;
 }
 
 bool isCbzPath(const std::string &mangaPath) {
   return cbz_is_cbz_path(mangaPath);
+}
+
+bool mangaPathExists(const std::string &mangaPath) {
+  struct stat st = {};
+  if (stat(mangaPath.c_str(), &st) != 0) return false;
+  if (isCbzPath(mangaPath)) return S_ISREG(st.st_mode);
+  return S_ISDIR(st.st_mode) && pageExistsFast(mangaPath, 0);
 }
 
 std::string displayName(const std::string &entry) {
@@ -266,7 +273,7 @@ static CbzArchive *cbz_cached_open(const std::string &path) {
   if (s_cbz && s_cbz_path == path) return s_cbz;
   cbz_close(s_cbz);
   s_cbz = nullptr;
-  s_cbz = cbz_open(path);
+  s_cbz = openCbzWithIndex(path);
   if (s_cbz) {
     s_cbz_path = path;
   } else {
@@ -342,57 +349,61 @@ void dropCachedBookData() {
   }
 }
 
+// Resolve a book's page count, preferring the persistent index:
+//   1. CBZ: openCbzWithIndex restores the entry table (and page count) with
+//      one small sequential read instead of reparsing the central directory.
+//      A changed archive (size/mtime) is re-parsed and re-indexed.
+//   2. Folder: index_load gives the count when the directory mtime matches;
+//      indexedFolderCountValid then confirms the boundary, so an append or
+//      removal still forces a rescan even if FAT kept the mtime. A full scan
+//      writes a fresh index for next boot.
+// The one-entry RAM cache keeps this off the hot path within a session.
 int findTotalPages(const std::string &folder) {
-  static std::string cachedFolder = "";
-  static int cachedCount = 0;
-  if (folder == cachedFolder) return cachedCount;
+  if (folder == s_totalPagesFolder) return s_totalPagesCount;
 
-  int count = findCachedPageCount(folder);
-  if (count >= 0) {
-    cachedFolder = folder;
-    cachedCount = count;
-    return count;
-  }
+  const std::string entry = entryName(folder);
+  int count = -1;
 
   if (isCbzPath(folder)) {
-    count = 0;
     CbzArchive *a = cbz_cached_open(folder);
-    if (a) count = (int)a->images.size();
-    cachedFolder = folder;
-    cachedCount = count;
-    storeCachedPageCount(folder, count);
-    return count;
-  }
-
-  if (!pageExistsFast(folder, 0)) {
-    cachedFolder = folder;
-    cachedCount = 0;
-    storeCachedPageCount(folder, 0);
-    return 0;
-  }
-
-  int hi = 1;
-  while (pageExistsFast(folder, hi)) {
-    hi *= 2;
-    if (hi > 100000) {
-      hi = 100000;
-      break;
+    count = a ? (int)a->images.size() : 0;
+  } else {
+    BookIndex bi;
+    if (index_load(entry, folder, BOOK_IDX_FOLDER, bi) &&
+        indexedFolderCountValid(folder, bi.page_count)) {
+      count = bi.page_count;
+      ESP_LOGI(TAG, "indexed pages %s: %d", entry.c_str(), count);
+    } else {
+      // Miss or stale: probe the files, then persist the answer.
+      count = 0;
+      if (pageExistsFast(folder, 0)) {
+        int hi = 1;
+        while (pageExistsFast(folder, hi)) {
+          hi *= 2;
+          if (hi > 100000) {
+            hi = 100000;
+            break;
+          }
+        }
+        int lo = hi / 2;
+        while (lo + 1 < hi) {
+          int mid = lo + (hi - lo) / 2;
+          if (pageExistsFast(folder, mid))
+            lo = mid;
+          else
+            hi = mid;
+        }
+        count = lo + 1;
+      }
+      BookIndex fresh;
+      fresh.page_count = count;
+      if (index_save(entry, folder, BOOK_IDX_FOLDER, fresh)) index_maintain_cap();
     }
   }
 
-  int lo = hi / 2;
-  while (lo + 1 < hi) {
-    int mid = lo + (hi - lo) / 2;
-    if (pageExistsFast(folder, mid))
-      lo = mid;
-    else
-      hi = mid;
-  }
-
-  cachedFolder = folder;
-  cachedCount = lo + 1;
-  storeCachedPageCount(folder, cachedCount);
-  return cachedCount;
+  s_totalPagesFolder = folder;
+  s_totalPagesCount = count;
+  return count;
 }
 
 // Progress is throttled to spare NVS flash wear while paging quickly, but a

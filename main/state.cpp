@@ -6,7 +6,6 @@
 
 AppState appState = STATE_MENU;
 std::vector<std::string> mangaFolders;
-std::vector<int> mangaPageCounts;
 int menuSelected = 0;
 int menuScroll = 0;
 int bookmarkScroll = 0;
@@ -25,6 +24,7 @@ float zoomFactor = 1.0f;
 int zoomCX = DISPLAY_W / 2, zoomCY = DISPLAY_H / 2;
 std::string selectedBookmarkFolder = "";
 epd_mode_t currentEpdMode = epd_mode_t::epd_fast;
+bool forceStockRefresh = false;
 
 static LGFX_Sprite s_pageA(&M5.Display);
 static LGFX_Sprite s_pageB(&M5.Display);

@@ -38,6 +38,15 @@ a single fread + memcpy with no image decode. Cache keys embed the cover's
 size+mtime for automatic invalidation (plus a format magic), orphans are
 purged on book delete and capped at 256 files.
 
+Per-book structure is also indexed in `/sdcard/.index/` (magic + size/mtime,
+capped at 256): a CBZ caches its central directory, a folder caches its page
+count. Opening a book then restores the index with one small read instead of
+reparsing the archive or re-probing `m5_NNNN.jpg` files. A changed archive
+(size/mtime) or a folder whose boundary no longer matches re-indexes
+automatically; appends/removals are caught even when FAT leaves the directory
+mtime untouched. Deletes/renames purge the affected index and leaving the
+WiFi browser rescans the library.
+
 ## Porting notes (Arduino -> IDF)
 
 - `String` -> `std::string`; `File`/`SD.h` -> POSIX `fopen`/`opendir`/`stat`
@@ -63,5 +72,9 @@ purged on book delete and capped at 256 files.
 - `fullRefresh()` (ui.cpp) renders through a *solid* full waveform
   for the power-off splash that persists on screen: the same script keeps
   long-saturate black/white tables plus a `Panel_EPD::refreshStockWaveform()`
-  one-shot (frame counts tunable via `SOLID_*_FRAMES`). No switch-back is
-  needed; reboot re-expands the Kindle tables.
+  one-shot (frame counts tunable via `SOLID_*_FRAMES`). The power-off splash
+  never switches back (reboot re-expands the Kindle tables).
+- Opening a book and leaving the Book Menu also take one clean stock-waveform
+  repaint: `drawPage()` (ui.cpp) calls `refreshStockWaveform()` for that frame
+  and then `Panel_EPD::restoreFastWaveform()` to re-expand the Kindle tables,
+  so page turns after it stay fast. Requested via `forceStockRefresh`.

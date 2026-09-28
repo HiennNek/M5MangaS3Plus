@@ -204,8 +204,9 @@ ENGINE_METHOD = """  // >>> M5MangaS3Plus stock waveform one-shot (tools/patch_e
   // Rebuilds the expanded LUT from the STOCK tables and parks every pixel
   // at eraser step 0 (value kept as LUT index), so the next display() runs
   // one full original-quality sequence (~36 scans) ending on the new image.
-  // No switch-back: the only caller is the power-off splash, and reboot
-  // re-expands the Kindle tables from scratch.
+  // Used for the power-off splash (which stays) and, via
+  // restoreFastWaveform(), for a one-shot clean repaint when opening a book
+  // or leaving the Book Menu, after which normal page turns stay fast.
   void Panel_EPD::refreshStockWaveform(void)
   {
     waitDisplay();
@@ -252,10 +253,55 @@ ENGINE_METHOD = """  // >>> M5MangaS3Plus stock waveform one-shot (tools/patch_e
     _lut_2pixel = buf;
   }
 
+  // >>> M5MangaS3Plus restore fast waveform (tools/patch_epd_lut.py).
+  // Re-expands _lut_2pixel from the Kindle tables (lut_eraser/lut_quality),
+  // undoing refreshStockWaveform(). Called after a one-shot stock repaint
+  // (book open / leaving the Book Menu) so later page turns stay fast.
+  // The existing (stock-sized) buffer is large enough and rewritten in
+  // place, so no DMA allocation happens here. Pixels are left as the stock
+  // sequence parked them; the next display() re-steps them against the
+  // restored LUT.
+  void Panel_EPD::restoreFastWaveform(void)
+  {
+    waitDisplay();
+    if (!_lut_2pixel) return;
+    auto *buf = _lut_2pixel;
+    memset(buf, 0x0F, 256);
+    size_t lindex = 0;
+    for (int epd_mode = 0; epd_mode < 5; ++epd_mode) {
+      const uint32_t* lut_src = nullptr;
+      size_t lut_step = 0;
+      switch (epd_mode) {
+        default:                      lut_src = lut_eraser; lut_step = lut_eraser_step; break;
+        case epd_mode_t::epd_quality: lut_src = _config_detail.lut_quality; lut_step = _config_detail.lut_quality_step; break;
+        case epd_mode_t::epd_text:    lut_src = _config_detail.lut_text;    lut_step = _config_detail.lut_text_step;    break;
+        case epd_mode_t::epd_fast:    lut_src = _config_detail.lut_fast;    lut_step = _config_detail.lut_fast_step;    break;
+        case epd_mode_t::epd_fastest: lut_src = _config_detail.lut_fastest; lut_step = _config_detail.lut_fastest_step; break;
+      }
+      if (lut_src == nullptr) { continue; }
+      _lut_offset_table[epd_mode] = lindex >> 8;
+      _lut_remain_table[epd_mode] = lut_step;
+      for (int step = 0; step < lut_step; ++step) {
+        auto lu = lut_src[0];
+        for (int lv = 0; lv < 256; ++lv) {
+          buf[lindex] = (((lu >> ((lv >> 4) << 1)) & 3) << 2) + ((lu >> ((lv & 15) << 1)) & 3);
+          ++lindex;
+        }
+        ++lut_src;
+      }
+    }
+  }
+
+"""
+
+OLD_HPP_DECL = """    // M5MangaS3Plus stock waveform one-shot (tools/patch_epd_lut.py).
+    void refreshStockWaveform(void);
 """
 
 HPP_DECL = """    // M5MangaS3Plus stock waveform one-shot (tools/patch_epd_lut.py).
     void refreshStockWaveform(void);
+    // M5MangaS3Plus restore fast waveform (tools/patch_epd_lut.py).
+    void restoreFastWaveform(void);
 """
 
 
@@ -283,7 +329,8 @@ def main() -> int:
 
     has_solid = "Solid clean-refresh copies" in cpp
     has_decl = MARKER_V2 in hpp
-    if has_solid and has_decl:
+    has_restore = "Panel_EPD::restoreFastWaveform(void)" in cpp
+    if has_solid and has_decl and has_restore:
         print("EPD patch: already applied, skipping.")
         return 0
 
@@ -315,16 +362,27 @@ def main() -> int:
                   "  Run `idf.py fullclean` and rebuild.")
             return 1
 
-    if "void Panel_EPD::refreshStockWaveform(void)" not in cpp:
-        r = replace_once(
-            cpp, "  void Panel_EPD::beginTransaction(void)",
-            ENGINE_METHOD + "  void Panel_EPD::beginTransaction(void)",
-            "engine method")
-        if r is None:
-            return 1
-        cpp = r
+    if not has_restore:
+        # Migrate a v2 file that lacks restoreFastWaveform(): replace the old
+        # refreshStockWaveform-only block with the current ENGINE_METHOD.
+        old_engine_re = re.compile(
+            r"  // >>> M5MangaS3Plus stock waveform one-shot.*?"
+            r"  void Panel_EPD::beginTransaction\(void\)",
+            re.DOTALL)
+        if old_engine_re.search(cpp):
+            cpp = old_engine_re.sub(
+                ENGINE_METHOD + "  void Panel_EPD::beginTransaction(void)", cpp)
+        else:
+            r = replace_once(
+                cpp, "  void Panel_EPD::beginTransaction(void)",
+                ENGINE_METHOD + "  void Panel_EPD::beginTransaction(void)",
+                "engine method")
+            if r is None:
+                return 1
+            cpp = r
 
     if not has_decl:
+        # Pristine header: verify then inject both declarations.
         if sha256(EPD_HPP) != EXPECTED_PRISTINE_HPP:
             print("EPD patch: REFUSED - Panel_EPD.hpp hash mismatch.\n"
                   "  M5GFX was probably updated; re-verify anchors and "
@@ -333,6 +391,13 @@ def main() -> int:
         r = replace_once(hpp, "    void setPowerSave(bool flg) override;",
                          "    void setPowerSave(bool flg) override;\n" +
                          HPP_DECL, "hpp decl")
+        if r is None:
+            return 1
+        hpp = r
+    elif "restoreFastWaveform" not in hpp:
+        # Already-v2 header: swap the old one-method declaration for the
+        # current two-method block (no pristine hash check; it is patched).
+        r = replace_once(hpp, OLD_HPP_DECL, HPP_DECL, "hpp decl migration")
         if r is None:
             return 1
         hpp = r
